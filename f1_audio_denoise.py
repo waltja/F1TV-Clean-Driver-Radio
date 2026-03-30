@@ -38,6 +38,31 @@ class DenoiseConfig:
     gain_fall: float = 0.16  # slower when clamping noise
 
 
+PRESETS = {
+    "balanced": {
+        "low_gain_nospeech": 0.12,
+        "low_gain_speech": 0.35,
+        "high_gain_nospeech": 0.48,
+        "high_gain_speech": 0.96,
+        "speech_threshold": 0.42,
+    },
+    "radio_priority": {
+        "low_gain_nospeech": 0.08,
+        "low_gain_speech": 0.32,
+        "high_gain_nospeech": 0.40,
+        "high_gain_speech": 0.96,
+        "speech_threshold": 0.39,
+    },
+    "extreme_radio": {
+        "low_gain_nospeech": 0.05,
+        "low_gain_speech": 0.25,
+        "high_gain_nospeech": 0.34,
+        "high_gain_speech": 0.94,
+        "speech_threshold": 0.36,
+    },
+}
+
+
 class OnePoleLPF:
     def __init__(self, cutoff_hz: float, sample_rate: int):
         if cutoff_hz <= 0:
@@ -207,6 +232,16 @@ def process_wav_file(input_path: Path, output_path: Path, cfg: DenoiseConfig) ->
     write_wav(output_path, out, sample_rate, channels)
 
 
+def rms_mono(samples: Sequence[Tuple[float, ...]]) -> float:
+    if not samples:
+        return 0.0
+    acc = 0.0
+    for s in samples:
+        m = sum(s) / len(s)
+        acc += m * m
+    return math.sqrt(acc / len(samples))
+
+
 def process_realtime_stdin_stdout(cfg: DenoiseConfig, block_frames: int) -> None:
     reducer = F1EngineNoiseReducer(cfg)
     chunk_bytes = block_frames * cfg.channels * 2
@@ -304,26 +339,29 @@ def main() -> None:
     parser.add_argument("--frame-ms", type=float, default=10.0, help="Processing frame size")
     parser.add_argument("--block-frames", type=int, default=480, help="Stream mode read/write block size")
 
-    parser.add_argument("--low-gain-nospeech", type=float, default=0.12)
-    parser.add_argument("--low-gain-speech", type=float, default=0.35)
-    parser.add_argument("--high-gain-nospeech", type=float, default=0.48)
-    parser.add_argument("--high-gain-speech", type=float, default=0.96)
-    parser.add_argument("--speech-threshold", type=float, default=0.42)
+    parser.add_argument("--preset", choices=sorted(PRESETS.keys()), default="balanced")
+    parser.add_argument("--low-gain-nospeech", type=float, default=None)
+    parser.add_argument("--low-gain-speech", type=float, default=None)
+    parser.add_argument("--high-gain-nospeech", type=float, default=None)
+    parser.add_argument("--high-gain-speech", type=float, default=None)
+    parser.add_argument("--speech-threshold", type=float, default=None)
+    parser.add_argument("--report-levels", action="store_true", help="Print pre/post RMS report in WAV mode")
 
     parser.add_argument("--realtime-stdin-stdout", action="store_true", help="Read/write raw s16le PCM via stdin/stdout")
     parser.add_argument("--self-test", action="store_true", help="Run synthetic test")
 
     args = parser.parse_args()
 
+    preset = PRESETS[args.preset]
     cfg = DenoiseConfig(
         sample_rate=args.sample_rate,
         channels=args.channels,
         frame_ms=args.frame_ms,
-        low_gain_nospeech=args.low_gain_nospeech,
-        low_gain_speech=args.low_gain_speech,
-        high_gain_nospeech=args.high_gain_nospeech,
-        high_gain_speech=args.high_gain_speech,
-        speech_threshold=args.speech_threshold,
+        low_gain_nospeech=preset["low_gain_nospeech"] if args.low_gain_nospeech is None else args.low_gain_nospeech,
+        low_gain_speech=preset["low_gain_speech"] if args.low_gain_speech is None else args.low_gain_speech,
+        high_gain_nospeech=preset["high_gain_nospeech"] if args.high_gain_nospeech is None else args.high_gain_nospeech,
+        high_gain_speech=preset["high_gain_speech"] if args.high_gain_speech is None else args.high_gain_speech,
+        speech_threshold=preset["speech_threshold"] if args.speech_threshold is None else args.speech_threshold,
     )
 
     if args.self_test:
@@ -337,7 +375,25 @@ def main() -> None:
     if not args.input or not args.output:
         raise SystemExit("Use --input/--output for WAV mode, or --realtime-stdin-stdout for live pipe mode")
 
-    process_wav_file(args.input, args.output, cfg)
+    if not args.report_levels:
+        process_wav_file(args.input, args.output, cfg)
+        return
+
+    in_samples, sr, ch = read_wav(args.input)
+    cfg.sample_rate = sr
+    cfg.channels = ch
+    reducer = F1EngineNoiseReducer(cfg)
+    out = reducer.process_samples(in_samples)
+    out.extend(reducer.flush())
+    write_wav(args.output, out, sr, ch)
+
+    in_rms = rms_mono(in_samples)
+    out_rms = rms_mono(out)
+    db = 20 * math.log10((in_rms + 1e-12) / (out_rms + 1e-12))
+    print(f"preset: {args.preset}")
+    print(f"in_rms: {in_rms:.6f}")
+    print(f"out_rms: {out_rms:.6f}")
+    print(f"overall reduction (dB): {db:.2f}")
 
 
 if __name__ == "__main__":

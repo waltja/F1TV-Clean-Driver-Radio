@@ -55,6 +55,14 @@ ffmpeg -i "<STREAM_URL>" -f s16le -ac 2 -ar 48000 - \
 
 ## Tuning for “engine low, radio clear”
 
+Use presets first:
+
+- `--preset balanced` (default)
+- `--preset radio_priority` (recommended for your goal)
+- `--preset extreme_radio` (very aggressive engine suppression)
+
+You can still override individual parameters after picking a preset.
+
 Default tuning already favors that goal, but you can push it further:
 
 - Lower `--low-gain-nospeech` (e.g. `0.08`) to reduce engine bed more.
@@ -66,8 +74,8 @@ Example aggressive profile:
 ```bash
 python f1_audio_denoise.py \
   --input in.wav --output out.wav \
-  --low-gain-nospeech 0.08 \
-  --high-gain-nospeech 0.40
+  --preset radio_priority \
+  --report-levels
 ```
 
 ## Quick validation
@@ -77,3 +85,11 @@ python f1_audio_denoise.py --self-test
 ```
 
 The self-test verifies that non-speech (engine-only) sections are reduced more than speech sections.
+
+## Suggested command for your 48 kHz stereo stream
+
+```bash
+ffmpeg -i "<STREAM_URL>" -f s16le -ac 2 -ar 48000 - \
+| python f1_audio_denoise.py --realtime-stdin-stdout --sample-rate 48000 --channels 2 --preset radio_priority \
+| ffplay -f s16le -ac 2 -ar 48000 -
+```
