@@ -1,4 +1,4 @@
-# f1-radio
+# F1TV-Clean-Driver-Radio
 
 Isolates team radio audio from F1 on-board camera streams and plays it in sync with MultiViewer. Strips engine noise with RNNoise (via FFmpeg), leaving only driver/engineer comms. Includes tools for collecting training data to build a custom RNNoise model tuned to F1 radio noise.
 
