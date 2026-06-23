@@ -314,19 +314,21 @@ export async function fetchSeasonRaceWeekends(
 }
 
 // ---- fetchRaceSession -------------------------------------------------------
-// Given a race weekend pageId, returns the Race session contentId (the VIDEO
-// item with OBC: true and SessionPeriod == "R" or contentSubtype == "REPLAY").
+// Given a race weekend pageId and target season, returns the Race session
+// contentId (VIDEO with OBC: true + SessionPeriod "R") that matches the season.
+// Returns null if the race hasn't happened yet or no matching session is found.
 
 export async function fetchRaceSession(
   ascendonToken: string,
   raceWeekendPageId: number,
+  targetSeason: number,
 ): Promise<number | null> {
   const url = `${PAGE_URL_BASE}/${raceWeekendPageId}/${CONTENT_ENTITLEMENT}/2`;
   const json = (await apiFetch(url, ascendonToken)) as PageResponse;
   const allContainers = collectContainers(json.resultObj?.containers ?? []);
 
-  // Prefer: contentType VIDEO + OBC true + SessionPeriod R
-  // Fallback: contentType VIDEO + OBC true (any session)
+  // Prefer: contentType VIDEO + OBC true + SessionPeriod R + matching season
+  // Fallback: same but any SessionPeriod (still season-filtered)
   let fallback: number | null = null;
   for (const c of allContainers) {
     const meta = c.metadata;
@@ -334,6 +336,10 @@ export async function fetchRaceSession(
     const emf = meta.emfAttributes ?? {};
     if (!emf.OBC) continue;
     if (!meta.contentId) continue;
+
+    // Season can live in metadata.season or metadata.properties.season (same as BUNDLE items).
+    const itemSeason = meta.season ?? Number(meta.properties?.season);
+    if (itemSeason && itemSeason !== targetSeason) continue;
 
     if (emf.SessionPeriod === "R") return meta.contentId;
     fallback = meta.contentId;

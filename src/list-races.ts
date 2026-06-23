@@ -107,14 +107,15 @@ async function main(): Promise<void> {
 
     let contentId: number | null = null;
     try {
-      contentId = await fetchRaceSession(ascendonToken, weekend.pageId);
+      contentId = await fetchRaceSession(ascendonToken, weekend.pageId, targetSeason);
     } catch (err) {
       console.log(`FAILED (race session): ${err instanceof Error ? err.message : String(err)}`);
       continue;
     }
 
     if (contentId === null) {
-      console.log("no race session found");
+      // Race hasn't happened yet or no matching session — skip silently.
+      process.stdout.write("\r\x1b[K"); // clear the progress line
       continue;
     }
 
