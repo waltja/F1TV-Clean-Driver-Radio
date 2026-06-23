@@ -13,8 +13,10 @@ const CONTENT_DETAILS_BASE =
 const CONTENT_ENTITLEMENT = "F1_TV_Pro_Annual";
 
 // PAGE IDs that serve as season entry points.
-const CURRENT_SEASON_PAGE_ID = 395;
-const ARCHIVE_SEASON_PAGE_ID = 493; // past seasons (year selector)
+// CURRENT_SEASON_PAGE_ID: the dedicated season calendar page for the current year.
+// Update this once per year when F1TV creates the new season page.
+const CURRENT_SEASON_PAGE_ID = 12343; // 2026 season
+const ARCHIVE_PAGE_ID = 493; // past seasons hub (LAUNCHER entries link to per-season pages)
 
 interface EntitlementResponse {
   resultObj: { entitlementToken: string };
@@ -116,7 +118,13 @@ interface ContainerMetadata {
   emfAttributes?: EmfAttributes;
   title?: string;
   season?: number;
+  properties?: { season?: number | string; [key: string]: unknown };
   additionalStreams?: AdditionalStream[];
+}
+
+interface ContainerAction {
+  uri?: string;
+  targetType?: string;
 }
 
 interface ContainerItem {
@@ -124,6 +132,8 @@ interface ContainerItem {
   metadata?: ContainerMetadata;
   containers?: ContainerItem[] | { bundles?: unknown[] };
   retrieveItems?: { resultObj?: { containers?: ContainerItem[] } };
+  actions?: ContainerAction[];
+  onTitleClick?: ContainerAction;
 }
 
 interface AdditionalStream {
@@ -168,6 +178,61 @@ function collectContainers(items: ContainerItem[]): ContainerItem[] {
   return result;
 }
 
+// ---- discoverSeasonPageId --------------------------------------------------
+// Finds the F1TV page ID for a given season's race calendar.
+// For current year: uses CURRENT_SEASON_PAGE_ID constant as fallback.
+// For past years: scans the archive hub (PAGE 493) for a LAUNCHER entry.
+// Pass pageIdOverride to bypass discovery entirely (e.g. from --page flag).
+
+async function discoverSeasonPageId(
+  ascendonToken: string,
+  targetSeason: number,
+  debug?: boolean,
+  pageIdOverride?: number,
+): Promise<number | null> {
+  if (pageIdOverride !== undefined) {
+    if (debug) process.stderr.write(`[debug] using --page override: ${pageIdOverride}\n`);
+    return pageIdOverride;
+  }
+
+  const currentYear = new Date().getFullYear();
+
+  if (targetSeason === currentYear) {
+    if (debug) process.stderr.write(`[debug] current season -- using CURRENT_SEASON_PAGE_ID: ${CURRENT_SEASON_PAGE_ID}\n`);
+    return CURRENT_SEASON_PAGE_ID;
+  }
+
+  // For past seasons: scan the archive hub for a LAUNCHER whose URI contains the target year.
+  const archiveUrl = `${PAGE_URL_BASE}/${ARCHIVE_PAGE_ID}/${CONTENT_ENTITLEMENT}/2`;
+  if (debug) process.stderr.write(`[debug] scanning archive hub: GET ${archiveUrl}\n`);
+
+  const json = (await apiFetch(archiveUrl, ascendonToken)) as PageResponse;
+  const allContainers = collectContainers(json.resultObj?.containers ?? []);
+
+  for (const c of allContainers) {
+    const meta = c.metadata;
+    if (!meta) continue;
+    if (meta.contentType !== "LAUNCHER") continue;
+
+    // LAUNCHER URI format: /PAGE/{pageId} — extract pageId and check title/year.
+    const action = c.actions?.[0] ?? c.onTitleClick;
+    const uri = action?.uri ?? "";
+    const match = uri.match(/\/PAGE\/(\d+)/i);
+    if (!match) continue;
+
+    const pageId = Number(match[1]);
+    const title = meta.title ?? "";
+    // Title is typically the year as a string, e.g. "2025".
+    if (title.trim() === String(targetSeason)) {
+      if (debug) process.stderr.write(`[debug] found archive LAUNCHER for ${targetSeason}: page ${pageId}\n`);
+      return pageId;
+    }
+  }
+
+  if (debug) process.stderr.write(`[debug] no LAUNCHER found for ${targetSeason} in archive hub\n`);
+  return null;
+}
+
 // ---- fetchSeasonRaceWeekends ------------------------------------------------
 // Returns all race weekends (BUNDLEs with contentSubtype MEETING) for a season.
 // season defaults to the current calendar year.
@@ -176,18 +241,17 @@ export async function fetchSeasonRaceWeekends(
   ascendonToken: string,
   season?: number,
   debug?: boolean,
+  pageIdOverride?: number,
 ): Promise<RaceWeekend[]> {
   const targetSeason = season ?? new Date().getFullYear();
-  const currentYear = new Date().getFullYear();
 
-  // For the current season, start from the homepage (PAGE 395).
-  // For past seasons, start from the archive page (PAGE 493) and find the season container,
-  // then recurse into it. In practice, the archive page nests year groups.
-  // Simplest reliable approach: try the homepage first; if the target season isn't there,
-  // fall through to archive.
-  const pageId = targetSeason === currentYear ? CURRENT_SEASON_PAGE_ID : ARCHIVE_SEASON_PAGE_ID;
-  const url = `${PAGE_URL_BASE}/${pageId}/${CONTENT_ENTITLEMENT}/2`;
+  const seasonPageId = await discoverSeasonPageId(ascendonToken, targetSeason, debug, pageIdOverride);
+  if (seasonPageId === null) {
+    if (debug) process.stderr.write(`[debug] could not find season page for ${targetSeason}\n`);
+    return [];
+  }
 
+  const url = `${PAGE_URL_BASE}/${seasonPageId}/${CONTENT_ENTITLEMENT}/2`;
   if (debug) process.stderr.write(`[debug] GET ${url}\n`);
 
   const json = (await apiFetch(url, ascendonToken)) as PageResponse;
@@ -203,8 +267,9 @@ export async function fetchSeasonRaceWeekends(
       const meta = c.metadata;
       if (!meta) continue;
       const emf = meta.emfAttributes ?? {};
+      const seasonVal = meta.season ?? Number(meta.properties?.season) ?? emf["season"] ?? "?";
       process.stderr.write(
-        `[debug]   type=${meta.contentType ?? "?"} subtype=${meta.contentSubtype ?? "?"} season=${meta.season ?? emf["season"] ?? "?"} pageId=${emf.PageID ?? "?"} title=${meta.title ?? ""}\n`,
+        `[debug]   type=${meta.contentType ?? "?"} subtype=${meta.contentSubtype ?? "?"} season=${seasonVal} pageId=${emf.PageID ?? "?"} title=${meta.title ?? ""}\n`,
       );
     }
   }
@@ -217,16 +282,24 @@ export async function fetchSeasonRaceWeekends(
     if (meta.contentSubtype !== "MEETING") continue;
 
     const emf = meta.emfAttributes ?? {};
-    const itemSeason = meta.season ?? Number(emf["season"]);
-    if (itemSeason !== targetSeason) continue;
+
+    // Season can be in metadata.season (2025 style) or metadata.properties.season (2026 style).
+    const itemSeason = meta.season ?? Number(meta.properties?.season) ?? Number(emf["season"]);
+    // For current year, season may not be populated yet — accept items where it's missing.
+    const currentYear = new Date().getFullYear();
+    if (itemSeason && itemSeason !== targetSeason) continue;
 
     const pageIdVal = emf.PageID;
     if (!pageIdVal) continue;
 
+    // Season_Meeting_Ordinal is sometimes 0 (2026); fall back to Meeting_Number.
+    const ordinal = emf.Season_Meeting_Ordinal;
+    const roundNumber = (ordinal && ordinal > 0) ? ordinal : Number(emf.Meeting_Number ?? 0);
+
     weekends.push({
       pageId: pageIdVal,
-      season: itemSeason,
-      roundNumber: emf.Season_Meeting_Ordinal ?? Number(emf.Meeting_Number ?? 0),
+      season: itemSeason || targetSeason,
+      roundNumber,
       name: emf.Meeting_Name ?? meta.title ?? "",
       officialName: emf.Meeting_Official_Name ?? meta.title ?? "",
       startDate: emf.Meeting_Start_Date ?? "",

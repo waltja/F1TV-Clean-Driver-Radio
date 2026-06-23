@@ -150,8 +150,10 @@ Barcelona GP 2026
 ```
 
 Flags:
-- `--season YYYY` -- defaults to current year
+- `--season YYYY` -- defaults to current year; past seasons use the F1TV archive hub to discover the season page
 - `--count N` -- last N races only
+- `--page N` -- override the season page ID (bypass discovery; useful when the hardcoded current-season ID goes stale)
+- `--debug` -- dumps raw API container data to stderr (type, subtype, season, pageId per container); useful if no races are found
 
 Use the `--content-id` and `--channel-ids` flags on `collect-noise` (and `collect-speech`) to skip MV entirely and run against any race on record.
 
