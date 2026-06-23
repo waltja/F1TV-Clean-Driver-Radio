@@ -107,6 +107,47 @@ function rmsDb(pcm: Buffer): number {
   return 20 * Math.log10(rms / 32768);
 }
 
+// ---- OBC-off loop detector -------------------------------------------------
+//
+// When the OBC is off, F1TV streams a short looping idle tone (~600ms period)
+// instead of silence. It sits at around -48 dB RMS — above the normal noise
+// threshold — so it would be misclassified as speech if not caught early.
+//
+// Signature: the 600ms envelope repeats with near-zero variance. We split the
+// raw decoded segment into 600ms windows and check that the per-window RMS
+// values are almost identical (stddev < 1.5 dB). Real audio (engine or speech)
+// has far more dynamic variation.
+//
+// Call this on the raw decoded PCM *before* the expensive denoise decode.
+// Returns true if the OBC-off loop pattern is detected → skip the segment.
+
+const OBC_LOOP_WINDOW_SAMPLES = 28800; // 600ms at 48kHz
+const OBC_LOOP_MAX_STDDEV_DB  = 1.5;  // dB — any real audio varies more than this
+
+function isObcOffLoop(rawPcm: Buffer): boolean {
+  const bytesPerWindow = OBC_LOOP_WINDOW_SAMPLES * 2; // int16 = 2 bytes
+  const numWindows = Math.floor(rawPcm.length / bytesPerWindow);
+  if (numWindows < 4) return false; // need at least 4 windows (~2.4s) to be confident
+
+  const windowRms: number[] = [];
+  for (let w = 0; w < numWindows; w++) {
+    const offset = w * bytesPerWindow;
+    let sumSq = 0;
+    for (let i = offset; i < offset + bytesPerWindow; i += 2) {
+      const s = rawPcm.readInt16LE(i);
+      sumSq += s * s;
+    }
+    const rms = Math.sqrt(sumSq / OBC_LOOP_WINDOW_SAMPLES);
+    windowRms.push(rms > 0 ? 20 * Math.log10(rms / 32768) : -100);
+  }
+
+  const mean = windowRms.reduce((a, b) => a + b, 0) / windowRms.length;
+  const variance = windowRms.reduce((a, b) => a + (b - mean) ** 2, 0) / windowRms.length;
+  const stddev = Math.sqrt(variance);
+
+  return stddev < OBC_LOOP_MAX_STDDEV_DB;
+}
+
 // ---- Retry helper ----------------------------------------------------------
 
 async function withRetry<T>(
@@ -497,6 +538,29 @@ async function collectDriver(
       break;
     }
 
+    // OBC-off check: decode raw first (cheap), look for the repeating idle tone.
+    // This runs before the expensive denoise decode and saves an FFmpeg call.
+    let rawPcmForCheck: Buffer;
+    try {
+      rawPcmForCheck = await withRetry(
+        () => decodeSegmentRaw(concatBuffer),
+        `[${tla} seg ${segmentNumber}] raw decode (obc check)`,
+        2,
+        200,
+      );
+    } catch (err) {
+      errors++;
+      console.log(`[${tla}  ${label}] raw decode error — ${err instanceof Error ? err.message : String(err)} — skipping`);
+      segmentNumber++;
+      continue;
+    }
+
+    if (isObcOffLoop(rawPcmForCheck)) {
+      skipped++;
+      console.log(`[${tla}  ${label}] OBC-off loop detected — stopping`);
+      break;
+    }
+
     let denoisedPcm: Buffer;
     try {
       denoisedPcm = await withRetry(
@@ -517,22 +581,8 @@ async function collectDriver(
     const isSilent = db < args.threshold;
 
     if (isSilent) {
-      let rawPcm: Buffer;
-      try {
-        rawPcm = await withRetry(
-          () => decodeSegmentRaw(concatBuffer),
-          `[${tla} seg ${segmentNumber}] raw decode`,
-          2,
-          200,
-        );
-      } catch (err) {
-        errors++;
-        console.log(`[${tla}  ${label}] raw decode error — ${err instanceof Error ? err.message : String(err)} — skipping`);
-        segmentNumber++;
-        skipped++;
-        continue;
-      }
-      fs.writeSync(outFd, rawPcm);
+      // rawPcmForCheck was already decoded above for the OBC-off check — reuse it.
+      fs.writeSync(outFd, rawPcmForCheck);
       kept++;
       consecutiveSilent++;
       const keptMin = ((savedDurationS + kept * SEGMENT_DURATION_S) / 60).toFixed(1);
