@@ -175,6 +175,7 @@ function collectContainers(items: ContainerItem[]): ContainerItem[] {
 export async function fetchSeasonRaceWeekends(
   ascendonToken: string,
   season?: number,
+  debug?: boolean,
 ): Promise<RaceWeekend[]> {
   const targetSeason = season ?? new Date().getFullYear();
   const currentYear = new Date().getFullYear();
@@ -187,8 +188,26 @@ export async function fetchSeasonRaceWeekends(
   const pageId = targetSeason === currentYear ? CURRENT_SEASON_PAGE_ID : ARCHIVE_SEASON_PAGE_ID;
   const url = `${PAGE_URL_BASE}/${pageId}/${CONTENT_ENTITLEMENT}/2`;
 
+  if (debug) process.stderr.write(`[debug] GET ${url}\n`);
+
   const json = (await apiFetch(url, ascendonToken)) as PageResponse;
-  const allContainers = collectContainers(json.resultObj?.containers ?? []);
+  const topLevel = json.resultObj?.containers ?? [];
+
+  if (debug) process.stderr.write(`[debug] top-level containers: ${topLevel.length}\n`);
+
+  const allContainers = collectContainers(topLevel);
+
+  if (debug) {
+    process.stderr.write(`[debug] total containers after recursive collect: ${allContainers.length}\n`);
+    for (const c of allContainers) {
+      const meta = c.metadata;
+      if (!meta) continue;
+      const emf = meta.emfAttributes ?? {};
+      process.stderr.write(
+        `[debug]   type=${meta.contentType ?? "?"} subtype=${meta.contentSubtype ?? "?"} season=${meta.season ?? emf["season"] ?? "?"} pageId=${emf.PageID ?? "?"} title=${meta.title ?? ""}\n`,
+      );
+    }
+  }
 
   const weekends: RaceWeekend[] = [];
   for (const c of allContainers) {
@@ -213,6 +232,8 @@ export async function fetchSeasonRaceWeekends(
       startDate: emf.Meeting_Start_Date ?? "",
     });
   }
+
+  if (debug) process.stderr.write(`[debug] matched weekends: ${weekends.length}\n`);
 
   // Sort by round number ascending.
   weekends.sort((a, b) => a.roundNumber - b.roundNumber);

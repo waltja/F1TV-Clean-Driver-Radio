@@ -16,11 +16,25 @@ brew install node ffmpeg pnpm
 ### Ubuntu (24.04+)
 
 ```bash
-sudo apt update && sudo apt install -y build-essential ffmpeg curl
+sudo apt update && sudo apt install -y build-essential ffmpeg curl libasound2-dev libasound2-plugins
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt install -y nodejs
-corepack enable && corepack prepare pnpm@latest --activate
+# NodeSource's postinstall runs `corepack enable` without root and fails.
+# Disable corepack and install pnpm directly instead:
+sudo corepack disable
+sudo npm install -g pnpm
 ```
+
+#### WSL2 audio (required for live playback, not needed for data collection)
+
+WSL2 has no direct audio hardware access. Route through WSLg's PulseAudio socket:
+
+```bash
+echo -e "pcm.default pulse\nctl.default pulse" > ~/.asoundrc
+export PULSE_SERVER=unix:/mnt/wslg/PulseServer
+```
+
+Add the `export` line to your `~/.bashrc` so it persists across sessions. This requires Windows 11 WSL2 with WSLg (ships by default on recent builds).
 
 ### Fedora
 

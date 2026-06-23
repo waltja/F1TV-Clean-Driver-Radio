@@ -8,11 +8,12 @@ import type { RaceWeekend } from "./f1api.js";
 interface ListArgs {
   season: number | null;  // null = current year
   count: number | null;   // null = all races in season
+  debug: boolean;
 }
 
 function parseArgs(): ListArgs {
   const argv = process.argv.slice(2);
-  const args: ListArgs = { season: null, count: null };
+  const args: ListArgs = { season: null, count: null, debug: false };
 
   for (let i = 0; i < argv.length; i++) {
     const flag = argv[i];
@@ -26,6 +27,9 @@ function parseArgs(): ListArgs {
       case "--count":
         args.count = Number(next);
         i++;
+        break;
+      case "--debug":
+        args.debug = true;
         break;
       default:
         console.error(`Unknown flag: ${flag}`);
@@ -77,7 +81,7 @@ async function main(): Promise<void> {
 
   let weekends: RaceWeekend[];
   try {
-    weekends = await fetchSeasonRaceWeekends(ascendonToken, targetSeason);
+    weekends = await fetchSeasonRaceWeekends(ascendonToken, targetSeason, args.debug);
   } catch (err) {
     console.error(`Failed to fetch season: ${err instanceof Error ? err.message : String(err)}`);
     process.exit(1);
