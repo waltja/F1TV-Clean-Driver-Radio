@@ -416,8 +416,7 @@ async function main(): Promise<void> {
   console.log(`Wall time: ${(totalWallMs / 1000).toFixed(0)}s`);
   console.log("\nNext steps:");
   console.log("  Concatenate:  pnpm concat-noise");
-  console.log("  Play a file:  ffplay -f s16le -ar 48000 -ac 1 training-data/noise_<TLA>.raw");
-  console.log("  To WAV:       ffmpeg -f s16le -ar 48000 -ac 1 -i training-data/noise_<TLA>.raw training-data/noise_<TLA>.wav");
+  console.log("  Play a file:  ffplay -f s16le -ar 48000 training-data/noise_<TLA>.raw");
 }
 
 main().catch((err: unknown) => {
