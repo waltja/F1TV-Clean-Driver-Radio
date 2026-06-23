@@ -201,7 +201,9 @@ async function probeSegment(
       buildSegmentUrl(mediaTemplate, segNumber),
     );
     const concat = concatInitAndSegment(initSegment, raw);
-    const pcm = await decodeSegment(concat);
+    // Raw decode is sufficient for dead-zone detection (margin is ~40+ dB).
+    // Avoids spawning the full denoise filter chain just for a coarse RMS check.
+    const pcm = await decodeSegmentRaw(concat);
     return rmsDb(pcm);
   } catch {
     return -Infinity;
@@ -336,9 +338,17 @@ async function fineScanBackward(
   return candidate;
 }
 
+interface DriverStreamContext {
+  manifest: DashManifest;
+  initSegment: Buffer;
+}
+
 interface ProbedBounds {
   startSegment: number;
   endSegment: number | null;
+  /** Stream context from the probe driver — reusable to avoid re-fetching manifest/init. */
+  streamContext: DriverStreamContext;
+  probedTla: string;
 }
 
 /**
@@ -358,6 +368,7 @@ async function probeStreamBounds(
   const streamUrl = await fetchStreamUrl(tokens, contentId, channelId);
   const manifest = await fetchManifest(streamUrl);
   const initSegment = await downloadInit(manifest.initUrl);
+  const streamContext: DriverStreamContext = { manifest, initSegment };
 
   const userStartSeg =
     Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
@@ -443,7 +454,7 @@ async function probeStreamBounds(
     `[auto-skip] Collection range: segments ${startSegment}-${endSegment ?? "∞"} (~${startMin}-${endMin} min)`,
   );
 
-  return { startSegment, endSegment };
+  return { startSegment, endSegment, streamContext, probedTla: tla };
 }
 
 // ---- Per-driver collect loop -----------------------------------------------
@@ -467,6 +478,99 @@ interface SegmentBoundsOverride {
   endSegment: number | null;
 }
 
+// ---- Segment prefetcher ----------------------------------------------------
+
+/**
+ * Keeps a sliding window of in-flight segment downloads so the main loop
+ * receives a ready buffer without waiting for the network on every iteration.
+ *
+ * Downloads the next `prefetchCount` segments ahead of the current position.
+ * Each slot holds a Promise<Buffer> (init + segment concat'd and ready for FFmpeg).
+ * Failed downloads resolve to null so the caller's existing error handling fires.
+ */
+class SegmentPrefetcher {
+  private readonly initSegment: Buffer;
+  private readonly mediaTemplate: string;
+  private readonly prefetchCount: number;
+  private readonly endSegment: number | null;
+  private readonly pending = new Map<number, Promise<Buffer | null>>();
+  private stopped = false;
+
+  constructor(
+    initSegment: Buffer,
+    mediaTemplate: string,
+    endSegment: number | null,
+    prefetchCount = 2,
+  ) {
+    this.initSegment = initSegment;
+    this.mediaTemplate = mediaTemplate;
+    this.endSegment = endSegment;
+    this.prefetchCount = prefetchCount;
+  }
+
+  /** Seed initial downloads starting from `firstSegment`. */
+  prime(firstSegment: number): void {
+    for (let i = 0; i < this.prefetchCount; i++) {
+      this.enqueue(firstSegment + i);
+    }
+  }
+
+  /**
+   * Return the concat'd buffer for `segNumber`, awaiting if still in-flight.
+   * Also kicks off a download for `segNumber + prefetchCount` to maintain the window.
+   */
+  async get(segNumber: number): Promise<Buffer | null> {
+    this.enqueue(segNumber + this.prefetchCount);
+    const p = this.pending.get(segNumber);
+    if (p) {
+      const result = await p;
+      this.pending.delete(segNumber);
+      return result;
+    }
+    // Slot was never queued (e.g. start < prime range) — fetch inline.
+    return this.fetchOne(segNumber);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    this.pending.clear();
+  }
+
+  private enqueue(segNumber: number): void {
+    if (this.stopped) return;
+    if (this.endSegment !== null && segNumber > this.endSegment) return;
+    if (this.pending.has(segNumber)) return;
+    this.pending.set(segNumber, this.fetchOne(segNumber));
+  }
+
+  private async fetchOne(segNumber: number): Promise<Buffer | null> {
+    if (this.stopped) return null;
+    if (this.endSegment !== null && segNumber > this.endSegment) return null;
+    const url = buildSegmentUrl(this.mediaTemplate, segNumber);
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      if (this.stopped) return null;
+      try {
+        const raw = await downloadSegment(url);
+        return concatInitAndSegment(this.initSegment, raw);
+      } catch (err) {
+        lastErr = err;
+        const msg = err instanceof Error ? err.message : String(err);
+        // 404 = segment doesn't exist (past end of stream). Don't retry.
+        if (msg.includes("404")) return null;
+        if (attempt < 3) {
+          await new Promise((res) => setTimeout(res, 500 * attempt));
+        }
+      }
+    }
+    // Non-404 failure after retries: log but don't crash the loop.
+    console.log(
+      `  [prefetch] seg ${segNumber} failed after 3 attempts — ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
+    );
+    return null;
+  }
+}
+
 // Global cleanup registry so SIGINT can close open fds across all drivers.
 const openFds = new Map<string, number>();
 
@@ -478,13 +582,22 @@ async function collectDriver(
     startSegment: null,
     endSegment: null,
   },
+  /** Pre-fetched stream context from probe phase — avoids redundant manifest/init fetch. */
+  preloadedContext?: DriverStreamContext,
 ): Promise<CollectResult> {
   const tla = player.driverData.tla;
   const { contentId, channelId } = player.streamData;
 
-  const streamUrl = await fetchStreamUrl(tokens, contentId, channelId);
-  const manifest: DashManifest = await fetchManifest(streamUrl);
-  const initSegment = await downloadInit(manifest.initUrl);
+  let manifest: DashManifest;
+  let initSegment: Buffer;
+  if (preloadedContext) {
+    manifest = preloadedContext.manifest;
+    initSegment = preloadedContext.initSegment;
+  } else {
+    const streamUrl = await fetchStreamUrl(tokens, contentId, channelId);
+    manifest = await fetchManifest(streamUrl);
+    initSegment = await downloadInit(manifest.initUrl);
+  }
 
   const startSegment =
     boundsOverride.startSegment ??
@@ -536,6 +649,16 @@ async function collectDriver(
     `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | threshold: ${args.threshold} dB | out: ${outPath}`,
   );
 
+  // Prefetcher keeps 2 segment downloads running ahead of the decode loop,
+  // overlapping network I/O with FFmpeg CPU work.
+  const prefetcher = new SegmentPrefetcher(
+    initSegment,
+    manifest.mediaTemplate,
+    endSegment,
+    2,
+  );
+  prefetcher.prime(startSegment);
+
   while (endSegment === null || segmentNumber <= endSegment) {
     // Check --max-minutes cap (include already-saved from prior runs).
     if (
@@ -543,6 +666,7 @@ async function collectDriver(
       savedDurationS + kept * SEGMENT_DURATION_S >= maxSavedSamples
     ) {
       stoppedEarly = true;
+      prefetcher.stop();
       console.log(
         `[${tla}] Reached --max-minutes ${args.maxMinutes} — stopping`,
       );
@@ -554,25 +678,15 @@ async function collectDriver(
     const label = `${relSeg}${maxLabel}`;
 
     let concatBuffer: Buffer;
-    try {
-      concatBuffer = await withRetry(
-        async () => {
-          const raw = await downloadSegment(
-            buildSegmentUrl(manifest.mediaTemplate, segmentNumber),
-          );
-          return concatInitAndSegment(initSegment, raw);
-        },
-        `[${tla} seg ${segmentNumber}] download`,
-        3,
-        500,
-      );
-    } catch (err) {
-      // Consecutive failures after retries: likely past end of stream.
+    const prefetched = await prefetcher.get(segmentNumber);
+    if (prefetched === null) {
+      // null = download failed (likely past end of stream or stopped).
       console.log(
-        `[${tla}  ${label}] download failed after retries — ${err instanceof Error ? err.message : String(err)} — stopping`,
+        `[${tla}  ${label}] download failed — stopping`,
       );
       break;
     }
+    concatBuffer = prefetched;
 
 
     let denoisedPcm: Buffer;
@@ -628,6 +742,7 @@ async function collectDriver(
       // Retirement detection: N consecutive below-threshold segments suggests car stopped.
       if (args.retireAfter !== null && consecutiveSilent >= args.retireAfter) {
         retired = true;
+        prefetcher.stop();
         console.log(
           `[${tla}] ${consecutiveSilent} consecutive silent segments — likely retired. Stopping.`,
         );
@@ -643,6 +758,7 @@ async function collectDriver(
     segmentNumber++;
   }
 
+  prefetcher.stop();
   fs.closeSync(outFd);
   openFds.delete(tla);
 
@@ -746,6 +862,9 @@ async function main(): Promise<void> {
     startSegment: null,
     endSegment: null,
   };
+  // Stream context from the probe driver, reused to skip re-fetching manifest/init.
+  let probedStreamContext: { tla: string; context: DriverStreamContext } | null = null;
+
   if (args.autoSkip && args.length === null) {
     // Try each driver in order until one produces a usable probe result.
     for (const probePlayer of selected) {
@@ -754,6 +873,10 @@ async function main(): Promise<void> {
         boundsOverride = {
           startSegment: probed.startSegment,
           endSegment: probed.endSegment,
+        };
+        probedStreamContext = {
+          tla: probed.probedTla,
+          context: probed.streamContext,
         };
         break;
       } catch (err) {
@@ -770,10 +893,19 @@ async function main(): Promise<void> {
 
   const wallStart = Date.now();
 
-  // Run all drivers concurrently
+  // Run all drivers concurrently, passing pre-fetched stream context to whichever
+  // driver was used for probing so it skips a redundant manifest + init fetch.
   const results = await Promise.all(
     selected.map((player) =>
-      collectDriver(tokens, player, args, boundsOverride),
+      collectDriver(
+        tokens,
+        player,
+        args,
+        boundsOverride,
+        probedStreamContext?.tla === player.driverData.tla
+          ? probedStreamContext.context
+          : undefined,
+      ),
     ),
   );
 
