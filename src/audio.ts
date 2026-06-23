@@ -5,6 +5,7 @@ const MODEL_PATH = path.join(import.meta.dirname, "..", "models", "bd.rnnn");
 
 const FFMPEG_ARGS = [
   "-i", "pipe:0",
+  "-ac", "1",
   "-ar", "48000",
   "-af", `highpass=f=300,lowpass=f=3400,arnndn=m=${MODEL_PATH},arnndn=m=${MODEL_PATH},agate=threshold=-45dB:range=-30dB:attack=0.1:release=200,acompressor=threshold=-20dB:ratio=4:attack=5:release=50`,
   "-f", "s16le",
@@ -13,6 +14,7 @@ const FFMPEG_ARGS = [
 
 const FFMPEG_RAW_ARGS = [
   "-i", "pipe:0",
+  "-ac", "1",
   "-ar", "48000",
   "-f", "s16le",
   "pipe:1",

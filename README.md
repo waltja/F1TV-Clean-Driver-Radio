@@ -196,6 +196,22 @@ pnpm collect-noise --drivers 4 --max-minutes 30
 
 Outputs `training-data/noise_<TLA>.raw` files (16-bit LE mono 48kHz). Appends across runs so data accumulates from multiple races.
 
+If collected noise sounds slow, garbled, or like low-bit-depth audio, check for old stereo raw files. Raw PCM has no header, so playback tools cannot infer the channel layout. Current collection writes mono 48kHz s16le. Older files created before the mono fix may be stereo and should be deleted/re-collected or converted before training.
+
+One 5.76s mono segment is `552960` bytes. One stereo segment is `1105920` bytes.
+
+Correct playback:
+
+```bash
+ffplay -f s16le -ar 48000 -ch_layout mono training-data/noise_<TLA>.raw
+```
+
+Diagnostic playback for old stereo files:
+
+```bash
+ffplay -f s16le -ar 48000 -ch_layout stereo training-data/noise_<TLA>.raw
+```
+
 Flags:
 - `--start-min N` -- skip to minute N (avoids formation lap silence)
 - `--end-min N` -- stop at minute N from stream start (avoids post-race silence)
@@ -231,7 +247,7 @@ pnpm collect-speech --race singapore --session-type Qualifying
 pnpm collect-speech --session-path 2026/2026-06-14_Barcelona_Grand_Prix/2026-06-14_Race/
 ```
 
-Outputs `training-data/signal_radio.raw`. Appends across sessions.
+Outputs `training-data/signal_radio.raw` (16-bit LE mono 48kHz). Appends across sessions.
 
 Flags:
 - `--race NAME|N` -- meeting name substring or round number (required unless `--session-path` given)
@@ -304,11 +320,11 @@ cat training-data/signal_radio.raw path/to/librispeech.raw > rnnoise-training/sr
 
 ```bash
 # Listen to collected noise
-ffplay -f s16le -ar 48000 training-data/noise_HAM.raw
+ffplay -f s16le -ar 48000 -ch_layout mono training-data/noise_HAM.raw
 
 # Listen to collected speech clips
-ffplay -f s16le -ar 48000 training-data/signal_radio.raw
+ffplay -f s16le -ar 48000 -ch_layout mono training-data/signal_radio.raw
 
 # Seek into a file (e.g. 60 seconds in)
-ffplay -f s16le -ar 48000 -ss 60 training-data/noise_HAM.raw
+ffplay -f s16le -ar 48000 -ch_layout mono -ss 60 training-data/noise_HAM.raw
 ```
