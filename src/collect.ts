@@ -122,8 +122,7 @@ function rmsDb(pcm: Buffer): number {
 // Returns true if the OBC-off loop pattern is detected → skip the segment.
 
 const OBC_LOOP_WINDOW_SAMPLES = 28800; // 600ms at 48kHz
-const OBC_LOOP_MAX_STDDEV_DB  = 1.0;  // dB — any real audio varies more than this
-const OBC_LOOP_CONFIRM_COUNT  = 3;    // consecutive detections required before stopping
+const OBC_LOOP_MAX_STDDEV_DB  = 1.5;  // dB — any real audio varies more than this
 
 function isObcOffLoop(rawPcm: Buffer): boolean {
   const bytesPerWindow = OBC_LOOP_WINDOW_SAMPLES * 2; // int16 = 2 bytes
@@ -485,7 +484,6 @@ async function collectDriver(
   let stoppedEarly = false;
   let retired = false;
   let consecutiveSilent = 0;
-  let consecutiveObcOff = 0;
   let segmentNumber = startSegment;
   const startTime = Date.now();
 
@@ -558,17 +556,10 @@ async function collectDriver(
     }
 
     if (isObcOffLoop(rawPcmForCheck)) {
-      consecutiveObcOff++;
       skipped++;
-      console.log(`[${tla}  ${label}] OBC-off loop detected (${consecutiveObcOff}/${OBC_LOOP_CONFIRM_COUNT})`);
-      if (consecutiveObcOff >= OBC_LOOP_CONFIRM_COUNT) {
-        console.log(`[${tla}] OBC confirmed off — stopping`);
-        break;
-      }
-      segmentNumber++;
-      continue;
+      console.log(`[${tla}  ${label}] OBC-off loop detected — stopping`);
+      break;
     }
-    consecutiveObcOff = 0;
 
     let denoisedPcm: Buffer;
     try {
