@@ -4,7 +4,7 @@ Isolates team radio audio from F1 on-board camera streams and plays it in sync w
 
 ## Prerequisites
 
-An F1TV Pro subscription and your `ascendontoken` from browser devtools. **MultiViewer for F1** must be running at `localhost:10101`.
+An F1TV Pro subscription and your `ascendontoken` from browser devtools. **MultiViewer for F1** must be running at `localhost:10101` for live playback (`pnpm start`). Data collection tools (`collect-noise`, `collect-speech`, `list-races`) work without MV running.
 
 ### macOS
 
@@ -105,7 +105,8 @@ src/
   sync.ts             MV GraphQL polling, segment number math, seek detection
   types.ts            Shared interfaces and constants
   collect.ts          Noise collection CLI
-  collect-speech.ts   Speech collection CLI
+  collect-speech.ts   Speech collection CLI (MV-free, uses livetiming API)
+  livetiming.ts       F1 live timing API client (public, no auth)
   list-races.ts       Race and OBC channel discovery CLI
   types/speaker.d.ts  Type declarations for node-speaker
 scripts/
@@ -184,6 +185,7 @@ Flags:
 - `--threshold N` -- RMS dB cutoff, default -55
 - `--drivers N` -- random driver count in MV mode, default 2
 - `--max-minutes N` -- stop per driver after N min of saved noise
+- `--retire-after N` -- stop a driver after N consecutive below-threshold segments (detects retirement/car stopped); default disabled
 - `--out-dir DIR` -- default `./training-data`
 - `--content-id N` -- skip MV, use this race contentId directly
 - `--channel-ids TLA:channelId,...` -- skip MV, use these driver channels
@@ -192,21 +194,32 @@ Typical full-race invocation: `--start-min 20 --end-min 115 --max-minutes 30` (a
 
 ### Speech collection (`pnpm collect-speech`)
 
-Scrapes F1's curated TeamRadio clips from the live timing feed via MultiViewer. These are clean, pre-processed voice clips that supplement LibriSpeech as signal data for training.
-
-Open the race replay in MV, open the live timing page, and scrub to the end so all radio messages load. Then:
+Downloads F1's curated TeamRadio clips directly from the F1 live timing API (`livetiming.formula1.com`). No MultiViewer required, no F1TV auth required.
 
 ```bash
-# Grab all drivers' radio clips
-pnpm collect-speech
+# All drivers for a race (name substring match, case-insensitive)
+pnpm collect-speech --race barcelona
+
+# Specific round number
+pnpm collect-speech --race 10 --season 2026
 
 # Filter to specific drivers
-pnpm collect-speech --drivers HAM,VER,LEC
+pnpm collect-speech --race monaco --drivers HAM,RUS
+
+# Qualifying clips instead of race
+pnpm collect-speech --race singapore --session-type Qualifying
+
+# Direct path override (skip discovery)
+pnpm collect-speech --session-path 2026/2026-06-14_Barcelona_Grand_Prix/2026-06-14_Race/
 ```
 
 Outputs `training-data/signal_radio.raw`. Appends across sessions.
 
 Flags:
+- `--race NAME|N` -- meeting name substring or round number (required unless `--session-path` given)
+- `--season YYYY` -- default current year
+- `--session-type TYPE` -- default `Race`; other values: `Qualifying`, `Practice 1`, `Sprint`, etc.
+- `--session-path PATH` -- direct livetiming path override, skips discovery
 - `--drivers TLA,TLA` -- filter to specific drivers
 - `--concurrency N` -- parallel downloads, default 5
 - `--out-dir DIR` -- default `./training-data`

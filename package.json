@@ -10,6 +10,7 @@
     "collect-speech": "tsx src/collect-speech.ts",
     "concat-noise": "bash scripts/concat-noise.sh",
     "concat-signal": "bash scripts/concat-signal.sh",
+    "concat-speech": "bash scripts/concat-signal.sh",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],

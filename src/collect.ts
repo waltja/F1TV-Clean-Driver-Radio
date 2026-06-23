@@ -21,6 +21,7 @@ interface CollectArgs {
   numDrivers: number;       // only used when sourcing drivers from MV (ignored when --channel-ids set)
   outDir: string;
   maxMinutes: number | null; // max minutes of saved noise per driver (null = unlimited)
+  retireAfter: number | null; // stop after this many consecutive below-threshold segments (null = disabled)
   // MV-free mode: provide drivers explicitly instead of querying MultiViewer.
   contentId: number | null;         // race session contentId
   channelIds: { tla: string; channelId: number }[] | null; // explicit driver list
@@ -36,6 +37,7 @@ function parseArgs(): CollectArgs {
     numDrivers: 2,
     outDir: "./training-data",
     maxMinutes: null,
+    retireAfter: null,
     contentId: null,
     channelIds: null,
   };
@@ -71,6 +73,10 @@ function parseArgs(): CollectArgs {
         break;
       case "--max-minutes":
         args.maxMinutes = Number(next);
+        i++;
+        break;
+      case "--retire-after":
+        args.retireAfter = Number(next);
         i++;
         break;
       case "--content-id":
@@ -153,6 +159,7 @@ interface CollectResult {
   skipped: number;
   errors: number;
   stoppedEarly: boolean; // true if stopped by --max-minutes
+  retired: boolean;      // true if stopped by --retire-after consecutive silence
   outPath: string;
   durationSaved: number; // seconds
   wallTimeMs: number;
@@ -191,6 +198,8 @@ async function collectDriver(
   let skipped = 0;
   let errors = 0;
   let stoppedEarly = false;
+  let retired = false;
+  let consecutiveSilent = 0;
   let segmentNumber = startSegment;
   const startTime = Date.now();
 
@@ -282,9 +291,21 @@ async function collectDriver(
       }
       fs.writeSync(outFd, rawPcm);
       kept++;
+      consecutiveSilent++;
       const keptMin = ((savedDurationS + kept * SEGMENT_DURATION_S) / 60).toFixed(1);
       console.log(`[${tla}  ${label}] ${dbStr} — NOISE  (saved | ${keptMin} min total)`);
+
+      // Retirement detection: N consecutive below-threshold segments suggests car stopped.
+      if (args.retireAfter !== null && consecutiveSilent >= args.retireAfter) {
+        retired = true;
+        console.log(
+          `[${tla}] ${consecutiveSilent} consecutive silent segments — likely retired. Stopping.`,
+        );
+        segmentNumber++;
+        break;
+      }
     } else {
+      consecutiveSilent = 0; // Reset on any speech segment.
       skipped++;
       console.log(`[${tla}  ${label}] ${dbStr} — SPEECH (skipped)`);
     }
@@ -297,7 +318,7 @@ async function collectDriver(
 
   const durationSaved = kept * SEGMENT_DURATION_S;
   const wallTimeMs = Date.now() - startTime;
-  return { tla, total, kept, skipped, errors, stoppedEarly, outPath, durationSaved, wallTimeMs };
+  return { tla, total, kept, skipped, errors, stoppedEarly, retired, outPath, durationSaved, wallTimeMs };
 }
 
 // ---- SIGINT handler --------------------------------------------------------
@@ -403,7 +424,7 @@ async function main(): Promise<void> {
     const sizeMb = stat ? (stat.size / 1_048_576).toFixed(1) : "?";
     const noiseRatio = r.total > 0 ? ((r.kept / r.total) * 100).toFixed(0) : "0";
     const wallSec = (r.wallTimeMs / 1000).toFixed(0);
-    const earlyTag = r.stoppedEarly ? " [max-minutes reached]" : "";
+    const earlyTag = r.stoppedEarly ? " [max-minutes reached]" : r.retired ? " [retired]" : "";
     console.log(
       `${r.tla}: ${r.kept}/${r.total} segments noise (${noiseRatio}%) | ${r.errors} errors | ${mins} min saved | ${sizeMb} MB | ${wallSec}s elapsed${earlyTag}`,
     );
