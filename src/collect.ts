@@ -2,11 +2,20 @@ import fs from "node:fs";
 import fsPromises from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
-import { cacheToken, clearTokenCache, loadCachedToken, promptForToken } from "./auth.js";
+import {
+  cacheToken,
+  clearTokenCache,
+  loadCachedToken,
+  promptForToken,
+} from "./auth.js";
 import { decodeSegment, decodeSegmentRaw } from "./audio.js";
 import { buildSegmentUrl, fetchManifest } from "./dash.js";
 import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
-import { concatInitAndSegment, downloadInit, downloadSegment } from "./segments.js";
+import {
+  concatInitAndSegment,
+  downloadInit,
+  downloadSegment,
+} from "./segments.js";
 import { fetchPlayers } from "./sync.js";
 import { SEGMENT_DURATION_S } from "./types.js";
 import type { DashManifest, MvPlayer, Tokens } from "./types.js";
@@ -15,16 +24,16 @@ import type { DashManifest, MvPlayer, Tokens } from "./types.js";
 
 interface CollectArgs {
   startMin: number;
-  endMin: number | null;    // stop scanning at this many minutes into stream (null = no limit)
-  length: number | null;    // number of segments to scan (null = all); overrides endMin if both set
-  threshold: number;        // RMS dB below which a segment is classified as noise
-  numDrivers: number;       // number of randomly-selected MV OBC players to use
+  endMin: number | null; // stop scanning at this many minutes into stream (null = no limit)
+  length: number | null; // number of segments to scan (null = all); overrides endMin if both set
+  threshold: number; // RMS dB below which a segment is classified as noise
+  numDrivers: number; // number of randomly-selected MV OBC players to use
   outDir: string;
   maxMinutes: number | null; // max minutes of saved noise per driver (null = unlimited)
   retireAfter: number | null; // stop after this many consecutive below-threshold segments (null = disabled)
   // Auto-skip dead zones (pre-race filler / post-race silence at stream boundaries).
-  autoSkip: boolean;        // enabled by default; disable with --no-auto-skip
-  deadZoneDb: number;       // RMS dB below which a segment is considered dead-zone (default -70)
+  autoSkip: boolean; // enabled by default; disable with --no-auto-skip
+  deadZoneDb: number; // RMS dB below which a segment is considered dead-zone (default -70)
 }
 
 function parseArgs(): CollectArgs {
@@ -107,6 +116,7 @@ function rmsDb(pcm: Buffer): number {
   return 20 * Math.log10(rms / 32768);
 }
 
+<<<<<<< Updated upstream
 // ---- OBC-off loop detector -------------------------------------------------
 //
 // When the OBC is off, F1TV streams a short looping idle tone (~600ms period)
@@ -148,6 +158,8 @@ function isObcOffLoop(rawPcm: Buffer): boolean {
   return stddev < OBC_LOOP_MAX_STDDEV_DB;
 }
 
+=======
+>>>>>>> Stashed changes
 // ---- Retry helper ----------------------------------------------------------
 
 async function withRetry<T>(
@@ -228,7 +240,9 @@ async function probeSegment(
   segNumber: number,
 ): Promise<number> {
   try {
-    const raw = await downloadSegment(buildSegmentUrl(mediaTemplate, segNumber));
+    const raw = await downloadSegment(
+      buildSegmentUrl(mediaTemplate, segNumber),
+    );
     const concat = concatInitAndSegment(initSegment, raw);
     const pcm = await decodeSegment(concat);
     return rmsDb(pcm);
@@ -248,9 +262,15 @@ async function coarseScanForward(
   deadZoneDb: number,
   label: string,
 ): Promise<number | null> {
-  for (let seg = from; seg <= from + PROBE_MAX_FORWARD; seg += PROBE_COARSE_STEP) {
+  for (
+    let seg = from;
+    seg <= from + PROBE_MAX_FORWARD;
+    seg += PROBE_COARSE_STEP
+  ) {
     const db = await probeSegment(initSegment, mediaTemplate, seg);
-    process.stdout.write(`\r[${label}] Probing start... seg ${seg} (${(seg * SEGMENT_DURATION_S / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `);
+    process.stdout.write(
+      `\r[${label}] Probing start... seg ${seg} (${((seg * SEGMENT_DURATION_S) / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `,
+    );
     if (db > deadZoneDb) {
       return seg;
     }
@@ -271,7 +291,9 @@ async function coarseScanBackward(
 ): Promise<number | null> {
   for (let seg = from; seg >= 1; seg -= PROBE_COARSE_STEP) {
     const db = await probeSegment(initSegment, mediaTemplate, seg);
-    process.stdout.write(`\r[${label}] Probing end... seg ${seg} (${(seg * SEGMENT_DURATION_S / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `);
+    process.stdout.write(
+      `\r[${label}] Probing end... seg ${seg} (${((seg * SEGMENT_DURATION_S) / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `,
+    );
     if (db > deadZoneDb) {
       return seg;
     }
@@ -294,7 +316,9 @@ async function fineScanForward(
   let candidate = from;
   for (let seg = Math.max(1, from - PROBE_COARSE_STEP); ; seg++) {
     const db = await probeSegment(initSegment, mediaTemplate, seg);
-    process.stdout.write(`\r[${label}] Fine scan start... seg ${seg} ${db.toFixed(1)} dB    `);
+    process.stdout.write(
+      `\r[${label}] Fine scan start... seg ${seg} ${db.toFixed(1)} dB    `,
+    );
     if (db > deadZoneDb) {
       if (consecutive === 0) candidate = seg;
       consecutive++;
@@ -326,9 +350,15 @@ async function fineScanBackward(
 ): Promise<number> {
   let consecutive = 0;
   let candidate = from;
-  for (let seg = Math.min(from + PROBE_COARSE_STEP, from + 20); seg >= 1; seg--) {
+  for (
+    let seg = Math.min(from + PROBE_COARSE_STEP, from + 20);
+    seg >= 1;
+    seg--
+  ) {
     const db = await probeSegment(initSegment, mediaTemplate, seg);
-    process.stdout.write(`\r[${label}] Fine scan end... seg ${seg} ${db.toFixed(1)} dB    `);
+    process.stdout.write(
+      `\r[${label}] Fine scan end... seg ${seg} ${db.toFixed(1)} dB    `,
+    );
     if (db > deadZoneDb) {
       if (consecutive === 0) candidate = seg;
       consecutive++;
@@ -372,26 +402,40 @@ async function probeStreamBounds(
   const manifest = await fetchManifest(streamUrl);
   const initSegment = await downloadInit(manifest.initUrl);
 
-  const userStartSeg = Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
-  const userEndSeg = args.endMin !== null
-    ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
-    : null;
+  const userStartSeg =
+    Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
+  const userEndSeg =
+    args.endMin !== null
+      ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
+      : null;
 
   console.log(`[auto-skip] Probing stream bounds using ${tla}...`);
 
   // --- Find start ---
   let startSegment = userStartSeg;
   const coarseStart = await coarseScanForward(
-    initSegment, manifest.mediaTemplate, userStartSeg, args.deadZoneDb, "auto-skip",
+    initSegment,
+    manifest.mediaTemplate,
+    userStartSeg,
+    args.deadZoneDb,
+    "auto-skip",
   );
   if (coarseStart === null) {
-    console.log(`\n[auto-skip] Warning: no real audio found in first ${PROBE_MAX_FORWARD} segments from seg ${userStartSeg}. Using user start.`);
+    console.log(
+      `\n[auto-skip] Warning: no real audio found in first ${PROBE_MAX_FORWARD} segments from seg ${userStartSeg}. Using user start.`,
+    );
   } else {
     startSegment = await fineScanForward(
-      initSegment, manifest.mediaTemplate, coarseStart, args.deadZoneDb, "auto-skip",
+      initSegment,
+      manifest.mediaTemplate,
+      coarseStart,
+      args.deadZoneDb,
+      "auto-skip",
     );
-    const startMin = (startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
-    console.log(`[auto-skip] Race audio starts at segment ${startSegment} (~${startMin} min into stream)`);
+    const startMin = ((startSegment * SEGMENT_DURATION_S) / 60).toFixed(1);
+    console.log(
+      `[auto-skip] Race audio starts at segment ${startSegment} (~${startMin} min into stream)`,
+    );
   }
 
   // --- Find end ---
@@ -400,27 +444,47 @@ async function probeStreamBounds(
   // Only probe for end if --end-min wasn't explicitly set
   if (userEndSeg === null) {
     console.log(`[auto-skip] Finding last stream segment...`);
-    const lastSeg = await findLastSegment(manifest.mediaTemplate, startSegment + 400);
-    const lastMin = (lastSeg * SEGMENT_DURATION_S / 60).toFixed(1);
+    const lastSeg = await findLastSegment(
+      manifest.mediaTemplate,
+      startSegment + 400,
+    );
+    const lastMin = ((lastSeg * SEGMENT_DURATION_S) / 60).toFixed(1);
     console.log(`[auto-skip] Last segment: ${lastSeg} (~${lastMin} min)`);
 
     const coarseEnd = await coarseScanBackward(
-      initSegment, manifest.mediaTemplate, lastSeg, args.deadZoneDb, "auto-skip",
+      initSegment,
+      manifest.mediaTemplate,
+      lastSeg,
+      args.deadZoneDb,
+      "auto-skip",
     );
     if (coarseEnd === null) {
-      console.log(`\n[auto-skip] Warning: no real audio found scanning backward from seg ${lastSeg}. No end limit set.`);
+      console.log(
+        `\n[auto-skip] Warning: no real audio found scanning backward from seg ${lastSeg}. No end limit set.`,
+      );
     } else {
       endSegment = await fineScanBackward(
-        initSegment, manifest.mediaTemplate, coarseEnd, args.deadZoneDb, "auto-skip",
+        initSegment,
+        manifest.mediaTemplate,
+        coarseEnd,
+        args.deadZoneDb,
+        "auto-skip",
       );
-      const endMin = (endSegment * SEGMENT_DURATION_S / 60).toFixed(1);
-      console.log(`[auto-skip] Race audio ends at segment ${endSegment} (~${endMin} min into stream)`);
+      const endMin = ((endSegment * SEGMENT_DURATION_S) / 60).toFixed(1);
+      console.log(
+        `[auto-skip] Race audio ends at segment ${endSegment} (~${endMin} min into stream)`,
+      );
     }
   }
 
-  const startMin = (startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
-  const endMin = endSegment !== null ? (endSegment * SEGMENT_DURATION_S / 60).toFixed(1) : "stream end";
-  console.log(`[auto-skip] Collection range: segments ${startSegment}-${endSegment ?? "∞"} (~${startMin}-${endMin} min)`);
+  const startMin = ((startSegment * SEGMENT_DURATION_S) / 60).toFixed(1);
+  const endMin =
+    endSegment !== null
+      ? ((endSegment * SEGMENT_DURATION_S) / 60).toFixed(1)
+      : "stream end";
+  console.log(
+    `[auto-skip] Collection range: segments ${startSegment}-${endSegment ?? "∞"} (~${startMin}-${endMin} min)`,
+  );
 
   return { startSegment, endSegment };
 }
@@ -434,7 +498,7 @@ interface CollectResult {
   skipped: number;
   errors: number;
   stoppedEarly: boolean; // true if stopped by --max-minutes
-  retired: boolean;      // true if stopped by --retire-after consecutive silence
+  retired: boolean; // true if stopped by --retire-after consecutive silence
   outPath: string;
   durationSaved: number; // seconds
   wallTimeMs: number;
@@ -453,7 +517,10 @@ async function collectDriver(
   tokens: Tokens,
   player: MvPlayer,
   args: CollectArgs,
-  boundsOverride: SegmentBoundsOverride = { startSegment: null, endSegment: null },
+  boundsOverride: SegmentBoundsOverride = {
+    startSegment: null,
+    endSegment: null,
+  },
 ): Promise<CollectResult> {
   const tla = player.driverData.tla;
   const { contentId, channelId } = player.streamData;
@@ -462,16 +529,19 @@ async function collectDriver(
   const manifest: DashManifest = await fetchManifest(streamUrl);
   const initSegment = await downloadInit(manifest.initUrl);
 
-  const startSegment = boundsOverride.startSegment
-    ?? (Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1);
+  const startSegment =
+    boundsOverride.startSegment ??
+    Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
   // --length takes precedence over --end-min. --end-min is absolute from stream start.
   // boundsOverride.endSegment comes from auto-skip and is used when neither --length nor --end-min is set.
-  const endSegment = args.length !== null
-    ? startSegment + args.length - 1
-    : args.endMin !== null
-      ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
-      : boundsOverride.endSegment ?? null;
-  const maxSavedSamples = args.maxMinutes !== null ? args.maxMinutes * 60 : null;
+  const endSegment =
+    args.length !== null
+      ? startSegment + args.length - 1
+      : args.endMin !== null
+        ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
+        : (boundsOverride.endSegment ?? null);
+  const maxSavedSamples =
+    args.maxMinutes !== null ? args.maxMinutes * 60 : null;
 
   const outPath = path.join(args.outDir, `noise_${tla}.raw`);
   const outFd = fs.openSync(outPath, "a");
@@ -497,21 +567,28 @@ async function collectDriver(
     // File didn't exist yet, start from 0.
   }
 
-  const maxLabel = endSegment !== null ? `/${endSegment - startSegment + 1}` : "";
-  const rangeDesc = args.length !== null
-    ? `, scanning ${args.length} segments`
-    : args.endMin !== null
-      ? `, scanning to min ${args.endMin} (seg ${endSegment})`
-      : " (until stream end)";
+  const maxLabel =
+    endSegment !== null ? `/${endSegment - startSegment + 1}` : "";
+  const rangeDesc =
+    args.length !== null
+      ? `, scanning ${args.length} segments`
+      : args.endMin !== null
+        ? `, scanning to min ${args.endMin} (seg ${endSegment})`
+        : " (until stream end)";
   console.log(
     `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | threshold: ${args.threshold} dB | out: ${outPath}`,
   );
 
   while (endSegment === null || segmentNumber <= endSegment) {
     // Check --max-minutes cap (include already-saved from prior runs).
-    if (maxSavedSamples !== null && savedDurationS + kept * SEGMENT_DURATION_S >= maxSavedSamples) {
+    if (
+      maxSavedSamples !== null &&
+      savedDurationS + kept * SEGMENT_DURATION_S >= maxSavedSamples
+    ) {
       stoppedEarly = true;
-      console.log(`[${tla}] Reached --max-minutes ${args.maxMinutes} — stopping`);
+      console.log(
+        `[${tla}] Reached --max-minutes ${args.maxMinutes} — stopping`,
+      );
       break;
     }
 
@@ -523,7 +600,9 @@ async function collectDriver(
     try {
       concatBuffer = await withRetry(
         async () => {
-          const raw = await downloadSegment(buildSegmentUrl(manifest.mediaTemplate, segmentNumber));
+          const raw = await downloadSegment(
+            buildSegmentUrl(manifest.mediaTemplate, segmentNumber),
+          );
           return concatInitAndSegment(initSegment, raw);
         },
         `[${tla} seg ${segmentNumber}] download`,
@@ -538,6 +617,7 @@ async function collectDriver(
       break;
     }
 
+<<<<<<< Updated upstream
     // OBC-off check: decode raw first (cheap), look for the repeating idle tone.
     // This runs before the expensive denoise decode and saves an FFmpeg call.
     let rawPcmForCheck: Buffer;
@@ -561,6 +641,8 @@ async function collectDriver(
       break;
     }
 
+=======
+>>>>>>> Stashed changes
     let denoisedPcm: Buffer;
     try {
       denoisedPcm = await withRetry(
@@ -571,7 +653,9 @@ async function collectDriver(
       );
     } catch (err) {
       errors++;
-      console.log(`[${tla}  ${label}] decode error — ${err instanceof Error ? err.message : String(err)} — skipping`);
+      console.log(
+        `[${tla}  ${label}] decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
+      );
       segmentNumber++;
       continue;
     }
@@ -581,12 +665,33 @@ async function collectDriver(
     const isSilent = db < args.threshold;
 
     if (isSilent) {
-      // rawPcmForCheck was already decoded above for the OBC-off check — reuse it.
-      fs.writeSync(outFd, rawPcmForCheck);
+      let rawPcm: Buffer;
+      try {
+        rawPcm = await withRetry(
+          () => decodeSegmentRaw(concatBuffer),
+          `[${tla} seg ${segmentNumber}] raw decode`,
+          2,
+          200,
+        );
+      } catch (err) {
+        errors++;
+        console.log(
+          `[${tla}  ${label}] raw decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
+        );
+        segmentNumber++;
+        skipped++;
+        continue;
+      }
+      fs.writeSync(outFd, rawPcm);
       kept++;
       consecutiveSilent++;
-      const keptMin = ((savedDurationS + kept * SEGMENT_DURATION_S) / 60).toFixed(1);
-      console.log(`[${tla}  ${label}] ${dbStr} — NOISE  (saved | ${keptMin} min total)`);
+      const keptMin = (
+        (savedDurationS + kept * SEGMENT_DURATION_S) /
+        60
+      ).toFixed(1);
+      console.log(
+        `[${tla}  ${label}] ${dbStr} — NOISE  (saved | ${keptMin} min total)`,
+      );
 
       // Retirement detection: N consecutive below-threshold segments suggests car stopped.
       if (args.retireAfter !== null && consecutiveSilent >= args.retireAfter) {
@@ -611,7 +716,18 @@ async function collectDriver(
 
   const durationSaved = kept * SEGMENT_DURATION_S;
   const wallTimeMs = Date.now() - startTime;
-  return { tla, total, kept, skipped, errors, stoppedEarly, retired, outPath, durationSaved, wallTimeMs };
+  return {
+    tla,
+    total,
+    kept,
+    skipped,
+    errors,
+    stoppedEarly,
+    retired,
+    outPath,
+    durationSaved,
+    wallTimeMs,
+  };
 }
 
 // ---- SIGINT handler --------------------------------------------------------
@@ -665,19 +781,26 @@ async function main(): Promise<void> {
 
   // Build the driver list from MultiViewer OBC players.
   const players = await fetchPlayers();
-  const obcPlayers = players.filter((p) => p.streamData.contentId && p.streamData.channelId);
+  const obcPlayers = players.filter(
+    (p) => p.streamData.contentId && p.streamData.channelId,
+  );
 
   if (obcPlayers.length === 0) {
-    console.error("No OBC players found in MultiViewer. Open some OBC streams first.");
+    console.error(
+      "No OBC players found in MultiViewer. Open some OBC streams first.",
+    );
     process.exit(1);
   }
 
   // Randomly select N drivers
   const shuffled = [...obcPlayers].sort(() => Math.random() - 0.5);
-  const selected = shuffled.slice(0, Math.min(args.numDrivers, shuffled.length));
+  const selected = shuffled.slice(
+    0,
+    Math.min(args.numDrivers, shuffled.length),
+  );
 
   console.log(
-    `Selected ${selected.length} driver(s): ${selected.map((p) => p.driverData.driverNumber ? `${p.driverData.tla} #${p.driverData.driverNumber}` : p.driverData.tla).join(", ")}`,
+    `Selected ${selected.length} driver(s): ${selected.map((p) => (p.driverData.driverNumber ? `${p.driverData.tla} #${p.driverData.driverNumber}` : p.driverData.tla)).join(", ")}`,
   );
   if (args.maxMinutes !== null) {
     console.log(`Max noise to save per driver: ${args.maxMinutes} min`);
@@ -687,13 +810,19 @@ async function main(): Promise<void> {
   await fsPromises.mkdir(args.outDir, { recursive: true });
 
   // Auto-skip: probe stream boundaries before launching all drivers.
-  let boundsOverride: SegmentBoundsOverride = { startSegment: null, endSegment: null };
+  let boundsOverride: SegmentBoundsOverride = {
+    startSegment: null,
+    endSegment: null,
+  };
   if (args.autoSkip && args.length === null) {
     // Try each driver in order until one produces a usable probe result.
     for (const probePlayer of selected) {
       try {
         const probed = await probeStreamBounds(tokens, probePlayer, args);
-        boundsOverride = { startSegment: probed.startSegment, endSegment: probed.endSegment };
+        boundsOverride = {
+          startSegment: probed.startSegment,
+          endSegment: probed.endSegment,
+        };
         break;
       } catch (err) {
         console.warn(
@@ -711,7 +840,9 @@ async function main(): Promise<void> {
 
   // Run all drivers concurrently
   const results = await Promise.all(
-    selected.map((player) => collectDriver(tokens, player, args, boundsOverride)),
+    selected.map((player) =>
+      collectDriver(tokens, player, args, boundsOverride),
+    ),
   );
 
   const totalWallMs = Date.now() - wallStart;
@@ -719,19 +850,30 @@ async function main(): Promise<void> {
   // Summary
   console.log("\n--- Collection Summary ---");
   if (args.autoSkip && boundsOverride.startSegment !== null) {
-    const startMin = (boundsOverride.startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
-    const endMin = boundsOverride.endSegment !== null
-      ? (boundsOverride.endSegment * SEGMENT_DURATION_S / 60).toFixed(1)
-      : "stream end";
-    console.log(`Auto-skip range: segs ${boundsOverride.startSegment}-${boundsOverride.endSegment ?? "∞"} (~${startMin}-${endMin} min)`);
+    const startMin = (
+      (boundsOverride.startSegment * SEGMENT_DURATION_S) /
+      60
+    ).toFixed(1);
+    const endMin =
+      boundsOverride.endSegment !== null
+        ? ((boundsOverride.endSegment * SEGMENT_DURATION_S) / 60).toFixed(1)
+        : "stream end";
+    console.log(
+      `Auto-skip range: segs ${boundsOverride.startSegment}-${boundsOverride.endSegment ?? "∞"} (~${startMin}-${endMin} min)`,
+    );
   }
   for (const r of results) {
     const mins = (r.durationSaved / 60).toFixed(1);
     const stat = await fsPromises.stat(r.outPath).catch(() => null);
     const sizeMb = stat ? (stat.size / 1_048_576).toFixed(1) : "?";
-    const noiseRatio = r.total > 0 ? ((r.kept / r.total) * 100).toFixed(0) : "0";
+    const noiseRatio =
+      r.total > 0 ? ((r.kept / r.total) * 100).toFixed(0) : "0";
     const wallSec = (r.wallTimeMs / 1000).toFixed(0);
-    const earlyTag = r.stoppedEarly ? " [max-minutes reached]" : r.retired ? " [retired]" : "";
+    const earlyTag = r.stoppedEarly
+      ? " [max-minutes reached]"
+      : r.retired
+        ? " [retired]"
+        : "";
     console.log(
       `${r.tla}: ${r.kept}/${r.total} segments noise (${noiseRatio}%) | ${r.errors} errors | ${mins} min saved | ${sizeMb} MB | ${wallSec}s elapsed${earlyTag}`,
     );
@@ -739,12 +881,14 @@ async function main(): Promise<void> {
   }
 
   const totalKept = results.reduce((s, r) => s + r.kept, 0);
-  const totalDuration = (totalKept * SEGMENT_DURATION_S / 60).toFixed(1);
+  const totalDuration = ((totalKept * SEGMENT_DURATION_S) / 60).toFixed(1);
   console.log(`\nTotal across all drivers: ${totalDuration} min of noise data`);
   console.log(`Wall time: ${(totalWallMs / 1000).toFixed(0)}s`);
   console.log("\nNext steps:");
   console.log("  Concatenate:  pnpm concat-noise");
-  console.log("  Play a file:  ffplay -f s16le -ar 48000 -ch_layout mono training-data/noise_<TLA>.raw");
+  console.log(
+    "  Play a file:  ffplay -f s16le -ar 48000 -ch_layout mono training-data/noise_<TLA>.raw",
+  );
 }
 
 main().catch((err: unknown) => {
