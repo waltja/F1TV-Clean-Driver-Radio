@@ -25,6 +25,9 @@ interface CollectArgs {
   // MV-free mode: provide drivers explicitly instead of querying MultiViewer.
   contentId: number | null;         // race session contentId
   channelIds: { tla: string; channelId: number }[] | null; // explicit driver list
+  // Auto-skip dead zones (pre-race filler / post-race silence at stream boundaries).
+  autoSkip: boolean;        // enabled by default; disable with --no-auto-skip
+  deadZoneDb: number;       // RMS dB below which a segment is considered dead-zone (default -70)
 }
 
 function parseArgs(): CollectArgs {
@@ -40,6 +43,8 @@ function parseArgs(): CollectArgs {
     retireAfter: null,
     contentId: null,
     channelIds: null,
+    autoSkip: true,
+    deadZoneDb: -70,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -81,6 +86,13 @@ function parseArgs(): CollectArgs {
         break;
       case "--content-id":
         args.contentId = Number(next);
+        i++;
+        break;
+      case "--no-auto-skip":
+        args.autoSkip = false;
+        break;
+      case "--dead-zone-db":
+        args.deadZoneDb = Number(next);
         i++;
         break;
       case "--channel-ids": {
@@ -150,6 +162,257 @@ async function withRetry<T>(
   throw lastErr;
 }
 
+// ---- Auto-skip: dead-zone probe --------------------------------------------
+
+// How many segments must be consistently above deadZoneDb to confirm real audio.
+const PROBE_CONFIRM_COUNT = 3;
+// Coarse probe step size in segments.
+const PROBE_COARSE_STEP = 20;
+// Maximum segments to scan forward when searching for stream start (~38 min).
+const PROBE_MAX_FORWARD = 400;
+
+/**
+ * Binary-search for the last downloadable segment number.
+ * Starts at `hint` and doubles until a 404 is hit, then narrows down.
+ */
+async function findLastSegment(
+  mediaTemplate: string,
+  hint: number,
+): Promise<number> {
+  // Phase 1: double upward from hint until we get a 404.
+  let lo = hint;
+  let hi = hint;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    const url = buildSegmentUrl(mediaTemplate, hi);
+    const res = await fetch(url, { method: "HEAD" });
+    if (!res.ok) break;
+    lo = hi;
+    hi = hi * 2;
+    if (hi > 100000) break; // safety cap
+  }
+
+  // Phase 2: binary search between lo (known good) and hi (known bad).
+  while (hi - lo > 1) {
+    const mid = Math.floor((lo + hi) / 2);
+    const url = buildSegmentUrl(mediaTemplate, mid);
+    const res = await fetch(url, { method: "HEAD" });
+    if (res.ok) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
+/**
+ * Sample a segment: download, decode (denoised), return RMS dB.
+ * Returns -Infinity on download/decode error.
+ */
+async function probeSegment(
+  initSegment: Buffer,
+  mediaTemplate: string,
+  segNumber: number,
+): Promise<number> {
+  try {
+    const raw = await downloadSegment(buildSegmentUrl(mediaTemplate, segNumber));
+    const concat = concatInitAndSegment(initSegment, raw);
+    const pcm = await decodeSegment(concat);
+    return rmsDb(pcm);
+  } catch {
+    return -Infinity;
+  }
+}
+
+/**
+ * Scan forward from `from` in coarse steps to find the first segment above
+ * deadZoneDb. Returns the coarse candidate segment, or null if not found.
+ */
+async function coarseScanForward(
+  initSegment: Buffer,
+  mediaTemplate: string,
+  from: number,
+  deadZoneDb: number,
+  label: string,
+): Promise<number | null> {
+  for (let seg = from; seg <= from + PROBE_MAX_FORWARD; seg += PROBE_COARSE_STEP) {
+    const db = await probeSegment(initSegment, mediaTemplate, seg);
+    process.stdout.write(`\r[${label}] Probing start... seg ${seg} (${(seg * SEGMENT_DURATION_S / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `);
+    if (db > deadZoneDb) {
+      return seg;
+    }
+  }
+  return null;
+}
+
+/**
+ * Scan backward from `from` in coarse steps to find the last segment above
+ * deadZoneDb. Returns the coarse candidate, or null if not found.
+ */
+async function coarseScanBackward(
+  initSegment: Buffer,
+  mediaTemplate: string,
+  from: number,
+  deadZoneDb: number,
+  label: string,
+): Promise<number | null> {
+  for (let seg = from; seg >= 1; seg -= PROBE_COARSE_STEP) {
+    const db = await probeSegment(initSegment, mediaTemplate, seg);
+    process.stdout.write(`\r[${label}] Probing end... seg ${seg} (${(seg * SEGMENT_DURATION_S / 60).toFixed(1)} min) ${db.toFixed(1)} dB    `);
+    if (db > deadZoneDb) {
+      return seg;
+    }
+  }
+  return null;
+}
+
+/**
+ * Fine scan forward from `from`, require PROBE_CONFIRM_COUNT consecutive
+ * above-threshold segments. Returns the first confirmed segment.
+ */
+async function fineScanForward(
+  initSegment: Buffer,
+  mediaTemplate: string,
+  from: number,
+  deadZoneDb: number,
+  label: string,
+): Promise<number> {
+  let consecutive = 0;
+  let candidate = from;
+  for (let seg = Math.max(1, from - PROBE_COARSE_STEP); ; seg++) {
+    const db = await probeSegment(initSegment, mediaTemplate, seg);
+    process.stdout.write(`\r[${label}] Fine scan start... seg ${seg} ${db.toFixed(1)} dB    `);
+    if (db > deadZoneDb) {
+      if (consecutive === 0) candidate = seg;
+      consecutive++;
+      if (consecutive >= PROBE_CONFIRM_COUNT) {
+        process.stdout.write("\n");
+        return candidate;
+      }
+    } else {
+      consecutive = 0;
+    }
+    // Safety: don't scan past the original coarse hit + one step
+    if (seg > from + PROBE_COARSE_STEP) {
+      process.stdout.write("\n");
+      return candidate;
+    }
+  }
+}
+
+/**
+ * Fine scan backward from `from`, require PROBE_CONFIRM_COUNT consecutive
+ * above-threshold segments. Returns the last confirmed segment.
+ */
+async function fineScanBackward(
+  initSegment: Buffer,
+  mediaTemplate: string,
+  from: number,
+  deadZoneDb: number,
+  label: string,
+): Promise<number> {
+  let consecutive = 0;
+  let candidate = from;
+  for (let seg = Math.min(from + PROBE_COARSE_STEP, from + 20); seg >= 1; seg--) {
+    const db = await probeSegment(initSegment, mediaTemplate, seg);
+    process.stdout.write(`\r[${label}] Fine scan end... seg ${seg} ${db.toFixed(1)} dB    `);
+    if (db > deadZoneDb) {
+      if (consecutive === 0) candidate = seg;
+      consecutive++;
+      if (consecutive >= PROBE_CONFIRM_COUNT) {
+        process.stdout.write("\n");
+        return candidate;
+      }
+    } else {
+      consecutive = 0;
+      candidate = seg - 1; // reset: last good candidate is before this run
+    }
+    if (seg < from - PROBE_COARSE_STEP) {
+      process.stdout.write("\n");
+      return candidate;
+    }
+  }
+  process.stdout.write("\n");
+  return candidate;
+}
+
+interface ProbedBounds {
+  startSegment: number;
+  endSegment: number | null;
+}
+
+/**
+ * Probe one driver's stream to find the real audio start/end,
+ * skipping dead-zone filler at the boundaries.
+ *
+ * Auto-skip is constrained within any user-specified --start-min / --end-min.
+ */
+async function probeStreamBounds(
+  tokens: Tokens,
+  player: MvPlayer,
+  args: CollectArgs,
+): Promise<ProbedBounds> {
+  const tla = player.driverData.tla;
+  const { contentId, channelId } = player.streamData;
+
+  const streamUrl = await fetchStreamUrl(tokens, contentId, channelId);
+  const manifest = await fetchManifest(streamUrl);
+  const initSegment = await downloadInit(manifest.initUrl);
+
+  const userStartSeg = Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
+  const userEndSeg = args.endMin !== null
+    ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
+    : null;
+
+  console.log(`[auto-skip] Probing stream bounds using ${tla}...`);
+
+  // --- Find start ---
+  let startSegment = userStartSeg;
+  const coarseStart = await coarseScanForward(
+    initSegment, manifest.mediaTemplate, userStartSeg, args.deadZoneDb, "auto-skip",
+  );
+  if (coarseStart === null) {
+    console.log(`\n[auto-skip] Warning: no real audio found in first ${PROBE_MAX_FORWARD} segments from seg ${userStartSeg}. Using user start.`);
+  } else {
+    startSegment = await fineScanForward(
+      initSegment, manifest.mediaTemplate, coarseStart, args.deadZoneDb, "auto-skip",
+    );
+    const startMin = (startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
+    console.log(`[auto-skip] Race audio starts at segment ${startSegment} (~${startMin} min into stream)`);
+  }
+
+  // --- Find end ---
+  let endSegment: number | null = userEndSeg;
+
+  // Only probe for end if --end-min wasn't explicitly set
+  if (userEndSeg === null) {
+    console.log(`[auto-skip] Finding last stream segment...`);
+    const lastSeg = await findLastSegment(manifest.mediaTemplate, startSegment + 400);
+    const lastMin = (lastSeg * SEGMENT_DURATION_S / 60).toFixed(1);
+    console.log(`[auto-skip] Last segment: ${lastSeg} (~${lastMin} min)`);
+
+    const coarseEnd = await coarseScanBackward(
+      initSegment, manifest.mediaTemplate, lastSeg, args.deadZoneDb, "auto-skip",
+    );
+    if (coarseEnd === null) {
+      console.log(`\n[auto-skip] Warning: no real audio found scanning backward from seg ${lastSeg}. No end limit set.`);
+    } else {
+      endSegment = await fineScanBackward(
+        initSegment, manifest.mediaTemplate, coarseEnd, args.deadZoneDb, "auto-skip",
+      );
+      const endMin = (endSegment * SEGMENT_DURATION_S / 60).toFixed(1);
+      console.log(`[auto-skip] Race audio ends at segment ${endSegment} (~${endMin} min into stream)`);
+    }
+  }
+
+  const startMin = (startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
+  const endMin = endSegment !== null ? (endSegment * SEGMENT_DURATION_S / 60).toFixed(1) : "stream end";
+  console.log(`[auto-skip] Collection range: segments ${startSegment}-${endSegment ?? "∞"} (~${startMin}-${endMin} min)`);
+
+  return { startSegment, endSegment };
+}
+
 // ---- Per-driver collect loop -----------------------------------------------
 
 interface CollectResult {
@@ -165,6 +428,12 @@ interface CollectResult {
   wallTimeMs: number;
 }
 
+// Override start/end segments (e.g. from auto-skip probe). Null means use args.
+interface SegmentBoundsOverride {
+  startSegment: number | null;
+  endSegment: number | null;
+}
+
 // Global cleanup registry so SIGINT can close open fds across all drivers.
 const openFds = new Map<string, number>();
 
@@ -172,6 +441,7 @@ async function collectDriver(
   tokens: Tokens,
   player: MvPlayer,
   args: CollectArgs,
+  boundsOverride: SegmentBoundsOverride = { startSegment: null, endSegment: null },
 ): Promise<CollectResult> {
   const tla = player.driverData.tla;
   const { contentId, channelId } = player.streamData;
@@ -180,13 +450,15 @@ async function collectDriver(
   const manifest: DashManifest = await fetchManifest(streamUrl);
   const initSegment = await downloadInit(manifest.initUrl);
 
-  const startSegment = Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
+  const startSegment = boundsOverride.startSegment
+    ?? (Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1);
   // --length takes precedence over --end-min. --end-min is absolute from stream start.
+  // boundsOverride.endSegment comes from auto-skip and is used when neither --length nor --end-min is set.
   const endSegment = args.length !== null
     ? startSegment + args.length - 1
     : args.endMin !== null
       ? Math.floor((args.endMin * 60) / SEGMENT_DURATION_S)
-      : null;
+      : boundsOverride.endSegment ?? null;
   const maxSavedSamples = args.maxMinutes !== null ? args.maxMinutes * 60 : null;
 
   const outPath = path.join(args.outDir, `noise_${tla}.raw`);
@@ -407,17 +679,45 @@ async function main(): Promise<void> {
   // Ensure output directory exists
   await fsPromises.mkdir(args.outDir, { recursive: true });
 
+  // Auto-skip: probe stream boundaries before launching all drivers.
+  let boundsOverride: SegmentBoundsOverride = { startSegment: null, endSegment: null };
+  if (args.autoSkip && args.length === null) {
+    // Try each driver in order until one produces a usable probe result.
+    for (const probePlayer of selected) {
+      try {
+        const probed = await probeStreamBounds(tokens, probePlayer, args);
+        boundsOverride = { startSegment: probed.startSegment, endSegment: probed.endSegment };
+        break;
+      } catch (err) {
+        console.warn(
+          `[auto-skip] Probe failed for ${probePlayer.driverData.tla}: ${err instanceof Error ? err.message : String(err)}. Trying next driver...`,
+        );
+      }
+    }
+  } else if (!args.autoSkip) {
+    console.log("[auto-skip] Disabled via --no-auto-skip");
+  } else if (args.length !== null) {
+    console.log("[auto-skip] Skipped (--length overrides segment range)");
+  }
+
   const wallStart = Date.now();
 
   // Run all drivers concurrently
   const results = await Promise.all(
-    selected.map((player) => collectDriver(tokens, player, args)),
+    selected.map((player) => collectDriver(tokens, player, args, boundsOverride)),
   );
 
   const totalWallMs = Date.now() - wallStart;
 
   // Summary
   console.log("\n--- Collection Summary ---");
+  if (args.autoSkip && boundsOverride.startSegment !== null) {
+    const startMin = (boundsOverride.startSegment * SEGMENT_DURATION_S / 60).toFixed(1);
+    const endMin = boundsOverride.endSegment !== null
+      ? (boundsOverride.endSegment * SEGMENT_DURATION_S / 60).toFixed(1)
+      : "stream end";
+    console.log(`Auto-skip range: segs ${boundsOverride.startSegment}-${boundsOverride.endSegment ?? "∞"} (~${startMin}-${endMin} min)`);
+  }
   for (const r of results) {
     const mins = (r.durationSaved / 60).toFixed(1);
     const stat = await fsPromises.stat(r.outPath).catch(() => null);
