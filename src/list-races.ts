@@ -134,12 +134,9 @@ async function main(): Promise<void> {
 
     console.log(`${channels.length} drivers`);
 
-    const channelIds = channels
-      .map((c) => `${c.tla}:${c.channelId}`)
-      .join(",");
-
-    console.log(`${targetSeason} R${weekend.roundNumber} ${weekend.name}`);
-    console.log(`  pnpm collect-noise --content-id ${contentId} --channel-ids ${channelIds}`);
+    const driverList = channels.map((c) => c.tla).join(", ");
+    console.log(`${targetSeason} R${weekend.roundNumber} ${weekend.name} — contentId: ${contentId}`);
+    console.log(`  Drivers (${channels.length}): ${driverList}`);
     console.log("");
   }
 }

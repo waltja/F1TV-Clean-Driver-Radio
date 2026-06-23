@@ -18,13 +18,10 @@ interface CollectArgs {
   endMin: number | null;    // stop scanning at this many minutes into stream (null = no limit)
   length: number | null;    // number of segments to scan (null = all); overrides endMin if both set
   threshold: number;        // RMS dB below which a segment is classified as noise
-  numDrivers: number;       // only used when sourcing drivers from MV (ignored when --channel-ids set)
+  numDrivers: number;       // number of randomly-selected MV OBC players to use
   outDir: string;
   maxMinutes: number | null; // max minutes of saved noise per driver (null = unlimited)
   retireAfter: number | null; // stop after this many consecutive below-threshold segments (null = disabled)
-  // MV-free mode: provide drivers explicitly instead of querying MultiViewer.
-  contentId: number | null;         // race session contentId
-  channelIds: { tla: string; channelId: number }[] | null; // explicit driver list
   // Auto-skip dead zones (pre-race filler / post-race silence at stream boundaries).
   autoSkip: boolean;        // enabled by default; disable with --no-auto-skip
   deadZoneDb: number;       // RMS dB below which a segment is considered dead-zone (default -70)
@@ -41,8 +38,6 @@ function parseArgs(): CollectArgs {
     outDir: "./training-data",
     maxMinutes: null,
     retireAfter: null,
-    contentId: null,
-    channelIds: null,
     autoSkip: true,
     deadZoneDb: -70,
   };
@@ -84,10 +79,6 @@ function parseArgs(): CollectArgs {
         args.retireAfter = Number(next);
         i++;
         break;
-      case "--content-id":
-        args.contentId = Number(next);
-        i++;
-        break;
       case "--no-auto-skip":
         args.autoSkip = false;
         break;
@@ -95,27 +86,7 @@ function parseArgs(): CollectArgs {
         args.deadZoneDb = Number(next);
         i++;
         break;
-      case "--channel-ids": {
-        // Format: TLA:channelId,TLA:channelId,...
-        const pairs = next.split(",").map((s) => s.trim()).filter(Boolean);
-        args.channelIds = pairs.map((pair) => {
-          const [tla, id] = pair.split(":");
-          if (!tla || !id) {
-            console.error(`Invalid --channel-ids entry: "${pair}". Expected format: TLA:channelId`);
-            process.exit(1);
-          }
-          return { tla: tla.toUpperCase(), channelId: Number(id) };
-        });
-        i++;
-        break;
-      }
     }
-  }
-
-  // Validate: --channel-ids requires --content-id and vice versa.
-  if ((args.contentId !== null) !== (args.channelIds !== null)) {
-    console.error("--content-id and --channel-ids must be used together.");
-    process.exit(1);
   }
 
   return args;
@@ -642,32 +613,18 @@ async function main(): Promise<void> {
 
   const tokens: Tokens = { ascendonToken, entitlementToken };
 
-  // Build the driver list — either from explicit CLI args (MV-free) or from MultiViewer.
-  let selected: MvPlayer[];
+  // Build the driver list from MultiViewer OBC players.
+  const players = await fetchPlayers();
+  const obcPlayers = players.filter((p) => p.streamData.contentId && p.streamData.channelId);
 
-  if (args.contentId !== null && args.channelIds !== null) {
-    // MV-free mode: construct synthetic MvPlayer objects from CLI args.
-    selected = args.channelIds.map(({ tla, channelId }) => ({
-      id: `cli-${tla}`,
-      type: "OBC",
-      state: { interpolatedCurrentTime: 0, paused: false, live: false },
-      streamData: { contentId: args.contentId as number, channelId },
-      driverData: { tla, driverNumber: 0, teamName: "" },
-    }));
-  } else {
-    // MV mode: query MultiViewer for open OBC players.
-    const players = await fetchPlayers();
-    const obcPlayers = players.filter((p) => p.streamData.contentId && p.streamData.channelId);
-
-    if (obcPlayers.length === 0) {
-      console.error("No OBC players found in MultiViewer. Open some OBC streams first.");
-      process.exit(1);
-    }
-
-    // Randomly select N drivers
-    const shuffled = [...obcPlayers].sort(() => Math.random() - 0.5);
-    selected = shuffled.slice(0, Math.min(args.numDrivers, shuffled.length));
+  if (obcPlayers.length === 0) {
+    console.error("No OBC players found in MultiViewer. Open some OBC streams first.");
+    process.exit(1);
   }
+
+  // Randomly select N drivers
+  const shuffled = [...obcPlayers].sort(() => Math.random() - 0.5);
+  const selected = shuffled.slice(0, Math.min(args.numDrivers, shuffled.length));
 
   console.log(
     `Selected ${selected.length} driver(s): ${selected.map((p) => p.driverData.driverNumber ? `${p.driverData.tla} #${p.driverData.driverNumber}` : p.driverData.tla).join(", ")}`,

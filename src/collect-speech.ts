@@ -3,14 +3,7 @@ import fsPromises from "node:fs/promises";
 import path from "node:path";
 import process from "node:process";
 import { decodeMp3Raw } from "./audio.js";
-import {
-  buildRadioUrl,
-  fetchDriverList,
-  fetchSeasonIndex,
-  fetchTeamRadioCaptures,
-  type LiveTimingMeeting,
-  type LiveTimingSession,
-} from "./livetiming.js";
+import { MV_GRAPHQL_ENDPOINT } from "./types.js";
 
 // ---- CLI arg parsing -------------------------------------------------------
 
@@ -19,10 +12,6 @@ interface SpeechArgs {
   outFile: string;
   drivers: Set<string> | null; // null = all drivers
   concurrency: number;
-  season: number;
-  race: string | null;        // meeting name substring or round number as string
-  sessionType: string;        // "Race", "Qualifying", "Practice 1", etc.
-  sessionPath: string | null; // direct override, skips discovery
 }
 
 function parseArgs(): SpeechArgs {
@@ -32,10 +21,6 @@ function parseArgs(): SpeechArgs {
     outFile: "signal_radio.raw",
     drivers: null,
     concurrency: 5,
-    season: new Date().getFullYear(),
-    race: null,
-    sessionType: "Race",
-    sessionPath: null,
   };
 
   for (let i = 0; i < argv.length; i++) {
@@ -59,89 +44,152 @@ function parseArgs(): SpeechArgs {
         args.concurrency = Number(next);
         i++;
         break;
-      case "--season":
-        args.season = Number(next);
-        i++;
-        break;
-      case "--race":
-        args.race = next;
-        i++;
-        break;
-      case "--session-type":
-        args.sessionType = next;
-        i++;
-        break;
-      case "--session-path":
-        args.sessionPath = next;
-        i++;
-        break;
-      default:
-        console.error(`Unknown flag: ${flag}`);
-        process.exit(1);
     }
   }
 
   return args;
 }
 
-// ---- Race / session discovery ----------------------------------------------
+// ---- MV GraphQL query ------------------------------------------------------
 
-function printUsageHint(): void {
-  console.error(
-    "\nUsage: pnpm collect-speech --race <name|number> [--season YYYY] [--session-type TYPE]\n" +
-    "       pnpm collect-speech --session-path <path>\n\n" +
-    "Examples:\n" +
-    "  pnpm collect-speech --race barcelona\n" +
-    "  pnpm collect-speech --race 10 --season 2026\n" +
-    "  pnpm collect-speech --race monaco --session-type Qualifying\n" +
-    "  pnpm collect-speech --session-path 2026/2026-06-14_Barcelona_Grand_Prix/2026-06-14_Race/",
-  );
+interface TeamRadioCapture {
+  Utc: string;
+  RacingNumber: string;
+  Path: string;
 }
 
-function findMeeting(meetings: LiveTimingMeeting[], raceArg: string): LiveTimingMeeting {
-  // Try as a round number first (1-indexed position in season array).
-  const roundNum = Number(raceArg);
-  if (!isNaN(roundNum) && Number.isInteger(roundNum) && roundNum >= 1) {
-    if (roundNum > meetings.length) {
-      throw new Error(
-        `Round ${roundNum} not found — season has ${meetings.length} meetings so far.`,
-      );
+interface TeamRadioData {
+  Captures: TeamRadioCapture[];
+}
+
+interface SessionInfo {
+  Path: string;
+}
+
+interface F1LiveTimingState {
+  TeamRadio: TeamRadioData | null;
+  SessionInfo: SessionInfo | null;
+}
+
+interface TimingGraphQLResponse {
+  data?: { f1LiveTimingState: F1LiveTimingState | null };
+  errors?: Array<{ message: string }>;
+}
+
+const TIMING_QUERY = `
+  query {
+    f1LiveTimingState {
+      SessionInfo {
+        Path
+      }
+      TeamRadio {
+        Captures {
+          Utc
+          RacingNumber
+          Path
+        }
+      }
     }
-    return meetings[roundNum - 1];
   }
+`;
 
-  // Substring match on meeting name (case-insensitive).
-  const query = raceArg.toLowerCase();
-  const matches = meetings.filter((m) => m.name.toLowerCase().includes(query));
-
-  if (matches.length === 0) {
-    const names = meetings.map((m, i) => `  R${i + 1}: ${m.name}`).join("\n");
-    throw new Error(`No meeting found matching "${raceArg}". Available:\n${names}`);
-  }
-  if (matches.length > 1) {
-    const names = matches.map((m, i) => `  R${meetings.indexOf(m) + 1}: ${m.name}`).join("\n");
-    throw new Error(`Multiple meetings match "${raceArg}" — be more specific:\n${names}`);
-  }
-
-  return matches[0];
+// Also query DriverList so we can map RacingNumber -> TLA for display.
+interface DriverInfo {
+  RacingNumber: string;
+  Tla: string;
+  FullName: string;
 }
 
-function findSession(meeting: LiveTimingMeeting, sessionType: string): LiveTimingSession {
-  // Normalize: "Race" matches session.type "Race", "Practice 1" matches "Practice 1", etc.
-  const query = sessionType.toLowerCase();
-  const matches = meeting.sessions.filter((s) => s.type.toLowerCase() === query);
+interface DriverListState {
+  data?: { f1LiveTimingState: { DriverList: Record<string, DriverInfo> | null } | null };
+  errors?: Array<{ message: string }>;
+}
 
-  if (matches.length === 0) {
-    const types = meeting.sessions.map((s) => `  ${s.type}`).join("\n");
+const DRIVER_QUERY = `
+  query {
+    f1LiveTimingState {
+      DriverList
+    }
+  }
+`;
+
+async function fetchTimingState(): Promise<{ sessionPath: string; captures: TeamRadioCapture[] }> {
+  let res: Response;
+  try {
+    res = await fetch(MV_GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: TIMING_QUERY }),
+    });
+  } catch (err) {
+    const cause = err instanceof Error ? (err.cause as NodeJS.ErrnoException | undefined) : undefined;
+    if (cause?.code === "ECONNREFUSED") {
+      throw new Error(`Connection refused — is MultiViewer running at ${MV_GRAPHQL_ENDPOINT}?`);
+    }
+    throw new Error(`Network error: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
+  if (!res.ok) {
+    throw new Error(`HTTP ${res.status} from MV GraphQL`);
+  }
+
+  const json = (await res.json()) as TimingGraphQLResponse;
+
+  if (json.errors && json.errors.length > 0) {
+    throw new Error(`GraphQL error: ${json.errors.map((e) => e.message).join("; ")}`);
+  }
+
+  const state = json.data?.f1LiveTimingState;
+  if (!state) {
     throw new Error(
-      `No "${sessionType}" session found for ${meeting.name}. Available:\n${types}`,
+      "f1LiveTimingState is null — open the MultiViewer live timing page and scrub the replay to the end first.",
     );
   }
 
-  return matches[0];
+  const sessionPath = state.SessionInfo?.Path;
+  if (!sessionPath) {
+    throw new Error(
+      "SessionInfo.Path is missing — open the MultiViewer live timing page and scrub the replay to the end first.",
+    );
+  }
+
+  const captures = state.TeamRadio?.Captures ?? [];
+  if (captures.length === 0) {
+    throw new Error(
+      "TeamRadio.Captures is empty — scrub the MV replay to the end so all radio messages load, then retry.",
+    );
+  }
+
+  return { sessionPath, captures };
+}
+
+async function fetchDriverMap(): Promise<Map<string, string>> {
+  const tlaMap = new Map<string, string>();
+  try {
+    const res = await fetch(MV_GRAPHQL_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: DRIVER_QUERY }),
+    });
+    if (!res.ok) return tlaMap;
+    const json = (await res.json()) as DriverListState;
+    const driverList = json.data?.f1LiveTimingState?.DriverList;
+    if (driverList) {
+      for (const [, info] of Object.entries(driverList)) {
+        if (info.RacingNumber && info.Tla) {
+          tlaMap.set(info.RacingNumber, info.Tla);
+        }
+      }
+    }
+  } catch {
+    // Non-fatal — display falls back to racing number.
+  }
+  return tlaMap;
 }
 
 // ---- Download + decode worker ----------------------------------------------
+
+const LIVETIMING_BASE = "https://livetiming.formula1.com/static/";
 
 interface ClipResult {
   url: string;
@@ -202,72 +250,16 @@ async function runPool<T>(
 async function main(): Promise<void> {
   const args = parseArgs();
 
-  // ---- Resolve session path ------------------------------------------------
+  console.log("Querying MultiViewer for TeamRadio captures...");
+  const [{ sessionPath, captures }, driverMap] = await Promise.all([
+    fetchTimingState(),
+    fetchDriverMap(),
+  ]);
 
-  let sessionPath: string;
+  console.log(`Session: ${sessionPath}`);
+  console.log(`Total captures found: ${captures.length}`);
 
-  if (args.sessionPath !== null) {
-    // Direct override — skip discovery.
-    sessionPath = args.sessionPath.endsWith("/")
-      ? args.sessionPath
-      : `${args.sessionPath}/`;
-    console.log(`Session: ${sessionPath}`);
-  } else {
-    if (args.race === null) {
-      console.error("Error: --race or --session-path is required.");
-      printUsageHint();
-      process.exit(1);
-    }
-
-    process.stdout.write(`Fetching ${args.season} season index... `);
-    let meetings;
-    try {
-      meetings = await fetchSeasonIndex(args.season);
-    } catch (err) {
-      console.error(`\nFailed: ${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-    console.log(`${meetings.length} meetings`);
-
-    let meeting: LiveTimingMeeting;
-    let session: LiveTimingSession;
-    try {
-      meeting = findMeeting(meetings, args.race);
-      session = findSession(meeting, args.sessionType);
-    } catch (err) {
-      console.error(`\n${err instanceof Error ? err.message : String(err)}`);
-      process.exit(1);
-    }
-
-    sessionPath = session.path;
-    console.log(`Found: ${meeting.name} (${session.type}, ${session.startDate.slice(0, 10)})`);
-    console.log(`Session: ${sessionPath}`);
-  }
-
-  // ---- Fetch TeamRadio captures + driver list ------------------------------
-
-  process.stdout.write("Fetching TeamRadio captures... ");
-  let captures;
-  try {
-    captures = await fetchTeamRadioCaptures(sessionPath);
-  } catch (err) {
-    console.error(`\nFailed: ${err instanceof Error ? err.message : String(err)}`);
-    process.exit(1);
-  }
-
-  if (captures.length === 0) {
-    console.error("\nNo TeamRadio captures found for this session.");
-    console.error("The session may not have aired yet or data is not archived.");
-    process.exit(1);
-  }
-  console.log(`${captures.length} clips`);
-
-  process.stdout.write("Fetching driver list... ");
-  const driverMap = await fetchDriverList(sessionPath);
-  console.log(`${driverMap.size} drivers`);
-
-  // ---- Filter by --drivers -------------------------------------------------
-
+  // Filter by driver if requested.
   const filtered = args.drivers !== null
     ? captures.filter((c) => {
         const tla = driverMap.get(c.RacingNumber) ?? c.RacingNumber;
@@ -281,32 +273,32 @@ async function main(): Promise<void> {
   }
 
   if (args.drivers !== null) {
-    console.log(`Filtered to ${filtered.length} clips for drivers: ${[...args.drivers].join(", ")}`);
+    console.log(`Filtered to ${filtered.length} captures for drivers: ${[...args.drivers].join(", ")}`);
   }
-
-  // ---- Output file ---------------------------------------------------------
 
   await fsPromises.mkdir(args.outDir, { recursive: true });
 
   const outPath = path.join(args.outDir, args.outFile);
   const outFd = fs.openSync(outPath, "a");
 
+  // Compute already-saved duration for display.
   let existingS = 0;
   try {
     const stat = await fsPromises.stat(outPath);
     existingS = stat.size / (2 * 48000);
   } catch { /* new file */ }
 
-  console.log(`\nOutput: ${outPath}${existingS > 0 ? ` (${(existingS / 60).toFixed(1)} min already saved)` : ""}`);
+  console.log(`Output: ${outPath}${existingS > 0 ? ` (${(existingS / 60).toFixed(1)} min already saved)` : ""}`);
   console.log(`Downloading ${filtered.length} clips (concurrency: ${args.concurrency})...\n`);
-
-  // ---- Download + decode pool ----------------------------------------------
 
   let completed = 0;
 
   const tasks = filtered.map((capture) => async (): Promise<ClipResult> => {
     const tla = driverMap.get(capture.RacingNumber) ?? `#${capture.RacingNumber}`;
-    const url = buildRadioUrl(sessionPath, capture.Path);
+    // sessionPath from MV already has trailing slash in known formats, but guard either way.
+    const normalizedSession = sessionPath.endsWith("/") ? sessionPath : `${sessionPath}/`;
+    const capturePath = capture.Path.startsWith("/") ? capture.Path.slice(1) : capture.Path;
+    const url = `${LIVETIMING_BASE}${normalizedSession}${capturePath}`;
     const label = `${tla} @ ${capture.Utc.slice(11, 19)}`;
 
     const result = await processClip(url, label, outFd);
@@ -324,8 +316,6 @@ async function main(): Promise<void> {
   const results = await runPool(tasks, args.concurrency);
 
   fs.closeSync(outFd);
-
-  // ---- Summary -------------------------------------------------------------
 
   const ok = results.filter((r) => !r.error);
   const failed = results.filter((r) => r.error);
