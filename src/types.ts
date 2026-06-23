@@ -1,3 +1,5 @@
+import process from "node:process";
+
 export interface Tokens {
   ascendonToken: string;
   entitlementToken: string;
@@ -48,4 +50,4 @@ export const SEGMENT_DURATION_S = 5.76;
 export const SEEK_THRESHOLD_S = 5;
 export const RING_BUFFER_DEPTH = 5;
 export const POLL_INTERVAL_MS = 500;
-export const MV_GRAPHQL_ENDPOINT = "http://localhost:10101/api/graphql";
+export const MV_GRAPHQL_ENDPOINT = `http://${process.env.MV_HOST ?? "localhost:10101"}/api/graphql`;

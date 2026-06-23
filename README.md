@@ -36,6 +36,24 @@ export PULSE_SERVER=unix:/mnt/wslg/PulseServer
 
 Add the `export` line to your `~/.bashrc` so it persists across sessions. This requires Windows 11 WSL2 with WSLg (ships by default on recent builds).
 
+#### WSL2 MultiViewer connection
+
+MultiViewer runs on Windows. WSL2's `localhost` does not reach the Windows loopback stack, so you need to route via the Hyper-V gateway IP instead. That IP is dynamic and changes on WSL restart, so resolve it at shell startup:
+
+```bash
+export MV_HOST=$(ip route show default | awk '{print $3}'):10101
+```
+
+Add that line to `~/.bashrc`. Verify MV is reachable before running `pnpm start`:
+
+```bash
+curl -s "http://$MV_HOST/api/graphql" \
+  -H "Content-Type: application/json" \
+  -d '{"query":"{ players { id } }"}' | head -c 100
+```
+
+You should see `{"data":{"players":[...]}}`. If you get connection refused, check that the Windows Firewall allows inbound TCP on port 10101 (add a rule in Windows Defender Firewall or via Admin PowerShell: `New-NetFirewallRule -DisplayName "MultiViewer WSL2" -Direction Inbound -LocalPort 10101 -Protocol TCP -Action Allow`).
+
 ### Fedora
 
 ```bash
@@ -227,24 +245,42 @@ Flags:
 
 ### Preparing LibriSpeech data
 
-LibriSpeech provides clean speech samples to pair with the F1 engine noise for RNNoise training. The training pipeline expects a single `.raw` file (16-bit LE mono 48kHz PCM).
+LibriSpeech provides clean speech samples to pair with F1 engine noise for RNNoise training. More data produces a better model. Available subsets at https://www.openslr.org/12 :
 
-Download and extract `dev-clean` (~337MB compressed, ~1.7GB raw):
+| Subset | Compressed | Duration |
+|---|---|---|
+| `dev-clean` | 337 MB | ~5h |
+| `train-clean-100` | 6.3 GB | ~100h |
+| `train-clean-360` | 23 GB | ~360h |
+| `train-other-500` | 30 GB | ~500h |
+
+Download whichever subsets you want:
 
 ```bash
+# Minimum viable (quick test):
 wget https://www.openslr.org/resources/12/dev-clean.tar.gz
-tar xzf dev-clean.tar.gz
+
+# Recommended for a good model:
+wget https://www.openslr.org/resources/12/train-clean-100.tar.gz
+wget https://www.openslr.org/resources/12/train-other-500.tar.gz
+
+# Extract all downloaded archives:
+for f in *.tar.gz; do tar xzf "$f"; done
 ```
 
-Concatenate all FLAC files into a single raw PCM file. Use a `while read` loop -- `xargs -I{}` does not work reliably here (each ffmpeg stdout captures separately, producing ~1MB files):
+Concatenate all FLAC files into a single raw PCM file (16-bit LE mono 48kHz). Use a `while read` loop -- `xargs -I{}` does not work reliably here (each ffmpeg stdout captures separately, producing ~1MB files per call):
 
 ```bash
-find LibriSpeech/dev-clean -name "*.flac" | sort | while read f; do
-  ffmpeg -i "$f" -f s16le -ar 48000 - 2>/dev/null >> librispeech.raw
+find LibriSpeech/ -name "*.flac" | sort | while read f; do
+  ffmpeg -i "$f" -f s16le -ac 1 -ar 48000 - 2>/dev/null >> librispeech.raw
 done
 echo "Done: $(wc -c < librispeech.raw) bytes"
-# Expected: ~1.7GB for full dev-clean (~5h of audio)
+# dev-clean only: ~1.7 GB (~5h)
+# train-clean-100: ~34 GB (~100h)
+# All four subsets: ~330 GB (~960h)
 ```
+
+The `find` picks up all extracted subsets automatically -- no need to adjust the command based on which archives you downloaded.
 
 ### Concatenating training data
 

@@ -40,7 +40,11 @@ export async function fetchPlayers(): Promise<MvPlayer[]> {
   } catch (err) {
     const cause = err instanceof Error ? (err.cause as NodeJS.ErrnoException | undefined) : undefined;
     if (cause?.code === "ECONNREFUSED") {
-      throw new Error(`fetchPlayers: connection refused — is MultiViewer running at ${MV_GRAPHQL_ENDPOINT}?`);
+      throw new Error(
+        `fetchPlayers: connection refused at ${MV_GRAPHQL_ENDPOINT}. Is MultiViewer running?\n` +
+        `In WSL2, set MV_HOST to your Windows host IP:\n` +
+        `  export MV_HOST=$(ip route show default | awk '{print $3}'):10101`,
+      );
     }
     throw new Error(
       `fetchPlayers: network error contacting ${MV_GRAPHQL_ENDPOINT}: ${err instanceof Error ? err.message : String(err)}`,
