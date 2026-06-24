@@ -26,7 +26,7 @@ interface CollectArgs {
   startMin: number;
   endMin: number | null; // stop scanning at this many minutes into stream (null = no limit)
   length: number | null; // number of segments to scan (null = all); overrides endMin if both set
-  threshold: number; // RMS dB below which multi-pass denoised output is classified as noise (no speech)
+  threshold: number; // suppression ratio dB below which a segment is classified as noise (denoised - raw); default -20
   passes: number; // number of arnndn passes for speech detection (default 3)
   numDrivers: number; // number of randomly-selected MV OBC players to use
   outDir: string;
@@ -43,7 +43,7 @@ function parseArgs(): CollectArgs {
     startMin: 0,
     endMin: null,
     length: null,
-    threshold: -80,
+    threshold: -20,
     passes: 3,
     numDrivers: 2,
     outDir: "./training-data",
@@ -652,7 +652,7 @@ async function collectDriver(
         ? `, scanning to min ${args.endMin} (seg ${endSegment})`
         : " (until stream end)";
   console.log(
-    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | passes: ${args.passes} | floor: ${args.threshold} dB | out: ${outPath}`,
+    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | passes: ${args.passes} | ratio threshold: ${args.threshold} dB | out: ${outPath}`,
   );
 
   // Prefetcher keeps 2 segment downloads running ahead of the decode loop,
@@ -695,6 +695,24 @@ async function collectDriver(
     concatBuffer = prefetched;
 
 
+    // Decode raw PCM first — needed both for the ratio check and to save noise segments.
+    let rawPcm: Buffer;
+    try {
+      rawPcm = await withRetry(
+        () => decodeSegmentRaw(concatBuffer),
+        `[${tla} seg ${segmentNumber}] raw decode`,
+        2,
+        200,
+      );
+    } catch (err) {
+      errors++;
+      console.log(
+        `[${tla}  ${label}] raw decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
+      );
+      segmentNumber++;
+      continue;
+    }
+
     let denoisedPcm: Buffer;
     try {
       denoisedPcm = await withRetry(
@@ -706,34 +724,28 @@ async function collectDriver(
     } catch (err) {
       errors++;
       console.log(
-        `[${tla}  ${label}] decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
+        `[${tla}  ${label}] denoise decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
       );
       segmentNumber++;
       continue;
     }
 
-    const db = rmsDb(denoisedPcm);
-    const dbStr = Number.isFinite(db) ? `${db.toFixed(1)} dB` : "-inf dB";
-    const isSilent = db < args.threshold;
+    const rawDb = rmsDb(rawPcm);
+    const denoisedDb = rmsDb(denoisedPcm);
+    // Suppression ratio: how much arnndn reduced the signal.
+    // Heavy suppression (very negative ratio) = no speech detected.
+    // Mild suppression = speech present (model preserved it).
+    const ratio = Number.isFinite(rawDb) && Number.isFinite(denoisedDb)
+      ? denoisedDb - rawDb
+      : -Infinity;
+    const ratioStr = Number.isFinite(ratio) ? `${ratio.toFixed(1)} dB` : "-inf dB";
+    const rawDbStr = Number.isFinite(rawDb) ? `${rawDb.toFixed(1)} dB` : "-inf dB";
+    const denoisedDbStr = Number.isFinite(denoisedDb) ? `${denoisedDb.toFixed(1)} dB` : "-inf dB";
 
-    if (isSilent) {
-      let rawPcm: Buffer;
-      try {
-        rawPcm = await withRetry(
-          () => decodeSegmentRaw(concatBuffer),
-          `[${tla} seg ${segmentNumber}] raw decode`,
-          2,
-          200,
-        );
-      } catch (err) {
-        errors++;
-        console.log(
-          `[${tla}  ${label}] raw decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
-        );
-        segmentNumber++;
-        skipped++;
-        continue;
-      }
+    // Noise = arnndn suppressed heavily (ratio below threshold). Speech = ratio near 0.
+    const isNoise = ratio < args.threshold;
+
+    if (isNoise) {
       fs.writeSync(outFd, rawPcm);
       kept++;
       consecutiveSilent++;
@@ -742,7 +754,7 @@ async function collectDriver(
         60
       ).toFixed(1);
       console.log(
-        `[${tla}  ${label}] ${dbStr} — NOISE  (saved | ${keptMin} min total)`,
+        `[${tla}  ${label}] raw: ${rawDbStr} | denoised: ${denoisedDbStr} | ratio: ${ratioStr} — NOISE  (saved | ${keptMin} min total)`,
       );
 
       // Retirement detection: N consecutive below-threshold segments suggests car stopped.
@@ -750,7 +762,7 @@ async function collectDriver(
         retired = true;
         prefetcher.stop();
         console.log(
-          `[${tla}] ${consecutiveSilent} consecutive silent segments — likely retired. Stopping.`,
+          `[${tla}] ${consecutiveSilent} consecutive noise segments — likely retired. Stopping.`,
         );
         segmentNumber++;
         break;
@@ -758,7 +770,7 @@ async function collectDriver(
     } else {
       consecutiveSilent = 0; // Reset on any speech segment.
       skipped++;
-      console.log(`[${tla}  ${label}] ${dbStr} — SPEECH (skipped)`);
+      console.log(`[${tla}  ${label}] raw: ${rawDbStr} | denoised: ${denoisedDbStr} | ratio: ${ratioStr} — SPEECH (skipped)`);
     }
 
     segmentNumber++;
