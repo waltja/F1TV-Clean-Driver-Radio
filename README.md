@@ -88,6 +88,9 @@ corepack enable && corepack prepare pnpm@latest --activate
 ```bash
 pnpm install
 pnpm approve-builds speaker
+pnpm approve-builds onnxruntime-node
+pnpm install
+curl -L -o models/silero_vad.onnx https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx
 ```
 
 On first run you'll be prompted for your Ascendon token. Grab it from browser devtools on f1tv.formula1.com (Application > Cookies or Network headers). The token is cached at `.f1-radio-token` for subsequent runs.
@@ -104,7 +107,7 @@ Pick a driver from the list. Audio plays through your system speakers, synced to
 
 The audio pipeline per segment:
 1. Download the `tea` (team audio) DASH segment from F1TV CDN
-2. Decode and filter through FFmpeg: bandpass 300-3400Hz, double RNNoise pass, noise gate, compressor
+2. Decode and filter through FFmpeg: bandpass 300-3400Hz, double RNNoise pass
 3. Push 48kHz mono PCM to `node-speaker`
 
 Segments are 5.76 seconds each. A ring buffer of 5 segments (~29s) stays ahead of the MV playhead.
@@ -118,7 +121,8 @@ src/
   f1api.ts            F1TV entitlement + stream URL resolution
   dash.ts             MPD XML parse, tea audio track extraction, segment URL building
   segments.ts         Segment download, init+segment concatenation
-  audio.ts            FFmpeg decode pipelines (filtered, raw, mp3)
+  audio.ts            FFmpeg decode pipelines (filtered, raw, mp3); decodeSegmentDenoise removed
+  vad.ts              Silero VAD v6 ONNX wrapper (used by collect-noise)
   player.ts           node-speaker wrapper, ring buffer, seek/pause, PCM trim
   sync.ts             MV GraphQL polling, segment number math, seek detection
   types.ts            Shared interfaces and constants
@@ -132,6 +136,7 @@ scripts/
   concat-signal.sh    Concatenates signal_*.raw files (+ optional LibriSpeech)
 models/
   bd.rnnn             Default RNNoise model (Xiph banded)
+  silero_vad.onnx     Silero VAD v6 ONNX model (downloaded at setup, ~2MB)
 ```
 
 ## Architecture Notes
@@ -157,7 +162,7 @@ Discovers race sessions and OBC driver channel IDs from the F1TV content API. No
 pnpm list-races
 ```
 
-Lists all races in the current season. Each entry shows the race name, `contentId`, and per-driver `channelId` values, plus a ready-to-run `pnpm collect-noise` command you can copy directly:
+Lists all races in the current season. Each entry shows the race name, `contentId`, and per-driver `channelId` values:
 
 ```
 Barcelona GP 2026
@@ -165,7 +170,6 @@ Barcelona GP 2026
   HAM  (44)  channelId: 1007
   VER  (1)   channelId: 1008
   ...
-  pnpm collect-noise --content-id 1000010279 --channel-ids HAM:1007,VER:1008,...
 ```
 
 Flags:
@@ -174,18 +178,15 @@ Flags:
 - `--page N` -- override the season page ID (bypass discovery; useful when the hardcoded current-season ID goes stale)
 - `--debug` -- dumps raw API container data to stderr (type, subtype, season, pageId per container); useful if no races are found
 
-Use the `--content-id` and `--channel-ids` flags on `collect-noise` (and `collect-speech`) to skip MV entirely and run against any race on record.
+
 
 ### Noise collection (`pnpm collect-noise`)
 
-Downloads race segments, classifies each as speech or engine-only using the denoise chain + RMS measurement, and saves raw PCM from engine-only segments.
+Downloads race segments, classifies each as speech or engine-only using Silero VAD v6 (ONNX inference in-process), and saves raw PCM from engine-only segments. Requires MultiViewer running with OBC players open.
 
 ```bash
-# MV mode: picks random drivers from open OBC players
+# Picks random drivers from open MV OBC players
 pnpm collect-noise --drivers 4 --start-min 5
-
-# MV-free mode: specify race and drivers directly (use list-races to get IDs)
-pnpm collect-noise --content-id 1000010279 --channel-ids HAM:1007,VER:1008 --start-min 20 --end-min 115
 
 # Quick test: 1 driver, 11 segments starting at minute 20
 pnpm collect-noise --start-min 20 --length 11 --drivers 1
@@ -216,13 +217,14 @@ Flags:
 - `--start-min N` -- skip to minute N (avoids formation lap silence)
 - `--end-min N` -- stop at minute N from stream start (avoids post-race silence)
 - `--length N` -- scan N segments then stop (takes precedence over `--end-min`)
-- `--threshold N` -- RMS dB cutoff, default -55
+- `--vad-threshold N` -- VAD probability threshold above which a frame counts as speech, default `0.5`
+- `--vad-speech-pct N` -- fraction of frames with speech to classify a segment as SPEECH, default `0.05` (5%)
 - `--drivers N` -- random driver count in MV mode, default 2
 - `--max-minutes N` -- stop per driver after N min of saved noise
-- `--retire-after N` -- stop a driver after N consecutive below-threshold segments (detects retirement/car stopped); default disabled
+- `--retire-after N` -- stop a driver after N consecutive noise segments (detects retirement/car stopped); default disabled
+- `--no-auto-skip` -- disable automatic dead-zone detection at stream boundaries
+- `--dead-zone-db N` -- RMS dB below which a segment is considered dead-zone silence, default `-70`
 - `--out-dir DIR` -- default `./training-data`
-- `--content-id N` -- skip MV, use this race contentId directly
-- `--channel-ids TLA:channelId,...` -- skip MV, use these driver channels
 
 Typical full-race invocation: `--start-min 20 --end-min 115 --max-minutes 30` (adjust end-min to race length).
 
