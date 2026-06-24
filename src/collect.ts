@@ -8,7 +8,7 @@ import {
   loadCachedToken,
   promptForToken,
 } from "./auth.js";
-import { decodeSegment, decodeSegmentRaw } from "./audio.js";
+import { decodeSegmentDenoise, decodeSegmentRaw } from "./audio.js";
 import { buildSegmentUrl, fetchManifest } from "./dash.js";
 import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
 import {
@@ -26,7 +26,8 @@ interface CollectArgs {
   startMin: number;
   endMin: number | null; // stop scanning at this many minutes into stream (null = no limit)
   length: number | null; // number of segments to scan (null = all); overrides endMin if both set
-  threshold: number; // RMS dB below which a segment is classified as noise
+  threshold: number; // RMS dB below which multi-pass denoised output is classified as noise (no speech)
+  passes: number; // number of arnndn passes for speech detection (default 3)
   numDrivers: number; // number of randomly-selected MV OBC players to use
   outDir: string;
   maxMinutes: number | null; // max minutes of saved noise per driver (null = unlimited)
@@ -42,7 +43,8 @@ function parseArgs(): CollectArgs {
     startMin: 0,
     endMin: null,
     length: null,
-    threshold: -55,
+    threshold: -80,
+    passes: 3,
     numDrivers: 2,
     outDir: "./training-data",
     maxMinutes: null,
@@ -70,6 +72,10 @@ function parseArgs(): CollectArgs {
         break;
       case "--threshold":
         args.threshold = Number(next);
+        i++;
+        break;
+      case "--passes":
+        args.passes = Number(next);
         i++;
         break;
       case "--drivers":
@@ -646,7 +652,7 @@ async function collectDriver(
         ? `, scanning to min ${args.endMin} (seg ${endSegment})`
         : " (until stream end)";
   console.log(
-    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | threshold: ${args.threshold} dB | out: ${outPath}`,
+    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | passes: ${args.passes} | floor: ${args.threshold} dB | out: ${outPath}`,
   );
 
   // Prefetcher keeps 2 segment downloads running ahead of the decode loop,
@@ -692,7 +698,7 @@ async function collectDriver(
     let denoisedPcm: Buffer;
     try {
       denoisedPcm = await withRetry(
-        () => decodeSegment(concatBuffer),
+        () => decodeSegmentDenoise(concatBuffer, args.passes),
         `[${tla} seg ${segmentNumber}] denoise decode`,
         2,
         200,
