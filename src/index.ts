@@ -6,7 +6,7 @@ import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
 import { Player } from "./player.js";
 import { concatInitAndSegment, downloadInit, downloadSegment } from "./segments.js";
 import { fetchPlayers, isSeek, segmentNumberForTime } from "./sync.js";
-import { POLL_INTERVAL_MS, RING_BUFFER_DEPTH, SEGMENT_DURATION_S } from "./types.js";
+import { LATENCY_COMPENSATION_S, POLL_INTERVAL_MS, RING_BUFFER_DEPTH, SEGMENT_DURATION_S } from "./types.js";
 import type { MvPlayer, Tokens } from "./types.js";
 
 async function selectDriver(players: MvPlayer[]): Promise<MvPlayer> {
@@ -91,7 +91,7 @@ async function main(): Promise<void> {
           return;
         }
 
-        const currentTime = currentPlayer.state.interpolatedCurrentTime;
+        const currentTime = currentPlayer.state.interpolatedCurrentTime + LATENCY_COMPENSATION_S;
         const currentSegment = segmentNumberForTime(currentTime);
 
         const h = Math.floor(currentTime / 3600);

@@ -51,3 +51,7 @@ export const SEEK_THRESHOLD_S = 5;
 export const RING_BUFFER_DEPTH = 5;
 export const POLL_INTERVAL_MS = 500;
 export const MV_GRAPHQL_ENDPOINT = `http://${process.env.MV_HOST ?? "localhost:10101"}/api/graphql`;
+// Compensates for pipeline latency (poll + download + FFmpeg decode + speaker buffer).
+// Audio lags MV by ~800ms total; 500ms compensation keeps us slightly behind video
+// rather than risking audio leading video, which is more jarring.
+export const LATENCY_COMPENSATION_S = 0.5;
