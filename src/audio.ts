@@ -117,67 +117,6 @@ export function decodeSegmentRaw(concatBuffer: Buffer): Promise<Buffer> {
   });
 }
 
-export function decodeSegmentDenoise(
-  concatBuffer: Buffer,
-  passes: number,
-): Promise<Buffer> {
-  const arnndn = `arnndn=m=${MODEL_PATH}`;
-  const chain: string[] = [];
-  for (let i = 0; i < passes; i++) chain.push(arnndn);
-  const ffmpegArgs = [
-    "-i", "pipe:0",
-    "-ac", "1",
-    "-ar", "48000",
-    "-af", chain.join(","),
-    "-f", "s16le",
-    "pipe:1",
-  ];
-
-  return new Promise<Buffer>((resolve, reject) => {
-    const ffmpeg = spawn("ffmpeg", ffmpegArgs, {
-      stdio: ["pipe", "pipe", "ignore"],
-    });
-
-    const chunks: Buffer[] = [];
-    let settled = false;
-
-    ffmpeg.stdout.on("data", (chunk: Buffer) => {
-      chunks.push(chunk);
-    });
-
-    ffmpeg.once("error", (error: NodeJS.ErrnoException) => {
-      if (settled) return;
-      settled = true;
-      if (error.code === "ENOENT") {
-        reject(new Error("ffmpeg not found in PATH"));
-        return;
-      }
-      reject(new Error(`decodeSegmentDenoise: ${error.message}`));
-    });
-
-    ffmpeg.stdin.once("error", (error: NodeJS.ErrnoException) => {
-      if (settled) return;
-      settled = true;
-      reject(new Error(`decodeSegmentDenoise: stdin error: ${error.message}`));
-    });
-
-    ffmpeg.once("spawn", () => {
-      if (settled) return;
-      ffmpeg.stdin.end(concatBuffer);
-    });
-
-    ffmpeg.once("close", (code) => {
-      if (settled) return;
-      settled = true;
-      if (code !== 0) {
-        reject(new Error(`decodeSegmentDenoise: ffmpeg exited with code ${code}`));
-        return;
-      }
-      resolve(Buffer.concat(chunks));
-    });
-  });
-}
-
 export function decodeSegment(concatBuffer: Buffer): Promise<Buffer> {
   return new Promise<Buffer>((resolve, reject) => {
     const ffmpeg = spawn("ffmpeg", FFMPEG_ARGS, {

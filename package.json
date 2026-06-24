@@ -26,6 +26,7 @@
   "type": "module",
   "dependencies": {
     "fast-xml-parser": "^5.9.3",
+    "onnxruntime-node": "^1.22.0",
     "speaker": "^0.5.5"
   },
   "devDependencies": {

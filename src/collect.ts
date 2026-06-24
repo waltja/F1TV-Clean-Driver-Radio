@@ -8,7 +8,7 @@ import {
   loadCachedToken,
   promptForToken,
 } from "./auth.js";
-import { decodeSegmentDenoise, decodeSegmentRaw } from "./audio.js";
+import { decodeSegmentRaw } from "./audio.js";
 import { buildSegmentUrl, fetchManifest } from "./dash.js";
 import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
 import {
@@ -19,22 +19,23 @@ import {
 import { fetchPlayers } from "./sync.js";
 import { SEGMENT_DURATION_S } from "./types.js";
 import type { DashManifest, MvPlayer, Tokens } from "./types.js";
+import { createVadSession, runVad } from "./vad.js";
+import type { VadSession } from "./vad.js";
 
 // ---- CLI arg parsing -------------------------------------------------------
 
 interface CollectArgs {
   startMin: number;
-  endMin: number | null; // stop scanning at this many minutes into stream (null = no limit)
-  length: number | null; // number of segments to scan (null = all); overrides endMin if both set
-  threshold: number; // suppression ratio dB below which a segment is classified as noise (denoised - raw); default -20
-  passes: number; // number of arnndn passes for speech detection (default 3)
-  numDrivers: number; // number of randomly-selected MV OBC players to use
+  endMin: number | null;   // stop scanning at this many minutes into stream (null = no limit)
+  length: number | null;   // number of segments to scan (null = all); overrides endMin if both set
+  vadThreshold: number;    // probability above which a frame counts as speech (default 0.5)
+  vadSpeechPct: number;    // fraction of speech frames to classify segment as SPEECH (default 0.05)
+  numDrivers: number;      // number of randomly-selected MV OBC players to use
   outDir: string;
-  maxMinutes: number | null; // max minutes of saved noise per driver (null = unlimited)
-  retireAfter: number | null; // stop after this many consecutive below-threshold segments (null = disabled)
-  // Auto-skip dead zones (pre-race filler / post-race silence at stream boundaries).
-  autoSkip: boolean; // enabled by default; disable with --no-auto-skip
-  deadZoneDb: number; // RMS dB below which a segment is considered dead-zone (default -70)
+  maxMinutes: number | null;  // max minutes of saved noise per driver (null = unlimited)
+  retireAfter: number | null; // stop after this many consecutive noise segments (null = disabled)
+  autoSkip: boolean;          // enabled by default; disable with --no-auto-skip
+  deadZoneDb: number;         // RMS dB below which a segment is considered dead-zone (default -70)
 }
 
 function parseArgs(): CollectArgs {
@@ -43,8 +44,8 @@ function parseArgs(): CollectArgs {
     startMin: 0,
     endMin: null,
     length: null,
-    threshold: -20,
-    passes: 3,
+    vadThreshold: 0.5,
+    vadSpeechPct: 0.05,
     numDrivers: 2,
     outDir: "./training-data",
     maxMinutes: null,
@@ -70,12 +71,12 @@ function parseArgs(): CollectArgs {
         args.length = Number(next);
         i++;
         break;
-      case "--threshold":
-        args.threshold = Number(next);
+      case "--vad-threshold":
+        args.vadThreshold = Number(next);
         i++;
         break;
-      case "--passes":
-        args.passes = Number(next);
+      case "--vad-speech-pct":
+        args.vadSpeechPct = Number(next);
         i++;
         break;
       case "--drivers":
@@ -122,7 +123,6 @@ function rmsDb(pcm: Buffer): number {
   return 20 * Math.log10(rms / 32768);
 }
 
-
 // ---- Retry helper ----------------------------------------------------------
 
 async function withRetry<T>(
@@ -166,7 +166,6 @@ async function findLastSegment(
   mediaTemplate: string,
   hint: number,
 ): Promise<number> {
-  // Phase 1: double upward from hint until we get a 404.
   let lo = hint;
   let hi = hint;
   // eslint-disable-next-line no-constant-condition
@@ -179,7 +178,6 @@ async function findLastSegment(
     if (hi > 100000) break; // safety cap
   }
 
-  // Phase 2: binary search between lo (known good) and hi (known bad).
   while (hi - lo > 1) {
     const mid = Math.floor((lo + hi) / 2);
     const url = buildSegmentUrl(mediaTemplate, mid);
@@ -194,7 +192,7 @@ async function findLastSegment(
 }
 
 /**
- * Sample a segment: download, decode (denoised), return RMS dB.
+ * Sample a segment: download, decode (raw), return RMS dB.
  * Returns -Infinity on download/decode error.
  */
 async function probeSegment(
@@ -207,8 +205,6 @@ async function probeSegment(
       buildSegmentUrl(mediaTemplate, segNumber),
     );
     const concat = concatInitAndSegment(initSegment, raw);
-    // Raw decode is sufficient for dead-zone detection (margin is ~40+ dB).
-    // Avoids spawning the full denoise filter chain just for a coarse RMS check.
     const pcm = await decodeSegmentRaw(concat);
     return rmsDb(pcm);
   } catch {
@@ -294,7 +290,6 @@ async function fineScanForward(
     } else {
       consecutive = 0;
     }
-    // Safety: don't scan past the original coarse hit + one step
     if (seg > from + PROBE_COARSE_STEP) {
       process.stdout.write("\n");
       return candidate;
@@ -333,7 +328,7 @@ async function fineScanBackward(
       }
     } else {
       consecutive = 0;
-      candidate = seg - 1; // reset: last good candidate is before this run
+      candidate = seg - 1;
     }
     if (seg < from - PROBE_COARSE_STEP) {
       process.stdout.write("\n");
@@ -352,7 +347,6 @@ interface DriverStreamContext {
 interface ProbedBounds {
   startSegment: number;
   endSegment: number | null;
-  /** Stream context from the probe driver — reusable to avoid re-fetching manifest/init. */
   streamContext: DriverStreamContext;
   probedTla: string;
 }
@@ -360,8 +354,6 @@ interface ProbedBounds {
 /**
  * Probe one driver's stream to find the real audio start/end,
  * skipping dead-zone filler at the boundaries.
- *
- * Auto-skip is constrained within any user-specified --start-min / --end-min.
  */
 async function probeStreamBounds(
   tokens: Tokens,
@@ -385,7 +377,6 @@ async function probeStreamBounds(
 
   console.log(`[auto-skip] Probing stream bounds using ${tla}...`);
 
-  // --- Find start ---
   let startSegment = userStartSeg;
   const coarseStart = await coarseScanForward(
     initSegment,
@@ -412,10 +403,8 @@ async function probeStreamBounds(
     );
   }
 
-  // --- Find end ---
   let endSegment: number | null = userEndSeg;
 
-  // Only probe for end if --end-min wasn't explicitly set
   if (userEndSeg === null) {
     console.log(`[auto-skip] Finding last stream segment...`);
     const lastSeg = await findLastSegment(
@@ -471,14 +460,13 @@ interface CollectResult {
   kept: number;
   skipped: number;
   errors: number;
-  stoppedEarly: boolean; // true if stopped by --max-minutes
-  retired: boolean; // true if stopped by --retire-after consecutive silence
+  stoppedEarly: boolean;
+  retired: boolean;
   outPath: string;
   durationSaved: number; // seconds
   wallTimeMs: number;
 }
 
-// Override start/end segments (e.g. from auto-skip probe). Null means use args.
 interface SegmentBoundsOverride {
   startSegment: number | null;
   endSegment: number | null;
@@ -489,10 +477,6 @@ interface SegmentBoundsOverride {
 /**
  * Keeps a sliding window of in-flight segment downloads so the main loop
  * receives a ready buffer without waiting for the network on every iteration.
- *
- * Downloads the next `prefetchCount` segments ahead of the current position.
- * Each slot holds a Promise<Buffer> (init + segment concat'd and ready for FFmpeg).
- * Failed downloads resolve to null so the caller's existing error handling fires.
  */
 class SegmentPrefetcher {
   private readonly initSegment: Buffer;
@@ -514,17 +498,12 @@ class SegmentPrefetcher {
     this.prefetchCount = prefetchCount;
   }
 
-  /** Seed initial downloads starting from `firstSegment`. */
   prime(firstSegment: number): void {
     for (let i = 0; i < this.prefetchCount; i++) {
       this.enqueue(firstSegment + i);
     }
   }
 
-  /**
-   * Return the concat'd buffer for `segNumber`, awaiting if still in-flight.
-   * Also kicks off a download for `segNumber + prefetchCount` to maintain the window.
-   */
   async get(segNumber: number): Promise<Buffer | null> {
     this.enqueue(segNumber + this.prefetchCount);
     const p = this.pending.get(segNumber);
@@ -533,7 +512,6 @@ class SegmentPrefetcher {
       this.pending.delete(segNumber);
       return result;
     }
-    // Slot was never queued (e.g. start < prime range) — fetch inline.
     return this.fetchOne(segNumber);
   }
 
@@ -562,14 +540,12 @@ class SegmentPrefetcher {
       } catch (err) {
         lastErr = err;
         const msg = err instanceof Error ? err.message : String(err);
-        // 404 = segment doesn't exist (past end of stream). Don't retry.
         if (msg.includes("404")) return null;
         if (attempt < 3) {
           await new Promise((res) => setTimeout(res, 500 * attempt));
         }
       }
     }
-    // Non-404 failure after retries: log but don't crash the loop.
     console.log(
       `  [prefetch] seg ${segNumber} failed after 3 attempts — ${lastErr instanceof Error ? lastErr.message : String(lastErr)}`,
     );
@@ -588,7 +564,6 @@ async function collectDriver(
     startSegment: null,
     endSegment: null,
   },
-  /** Pre-fetched stream context from probe phase — avoids redundant manifest/init fetch. */
   preloadedContext?: DriverStreamContext,
 ): Promise<CollectResult> {
   const tla = player.driverData.tla;
@@ -608,8 +583,6 @@ async function collectDriver(
   const startSegment =
     boundsOverride.startSegment ??
     Math.floor((args.startMin * 60) / SEGMENT_DURATION_S) + 1;
-  // --length takes precedence over --end-min. --end-min is absolute from stream start.
-  // boundsOverride.endSegment comes from auto-skip and is used when neither --length nor --end-min is set.
   const endSegment =
     args.length !== null
       ? startSegment + args.length - 1
@@ -629,15 +602,13 @@ async function collectDriver(
   let errors = 0;
   let stoppedEarly = false;
   let retired = false;
-  let consecutiveSilent = 0;
+  let consecutiveNoise = 0;
   let segmentNumber = startSegment;
   const startTime = Date.now();
 
-  // Compute already-saved duration from existing file size (for max-minutes tracking across runs).
   let savedDurationS = 0;
   try {
     const existing = await fsPromises.stat(outPath);
-    // 2 bytes per sample, 48000 samples/sec
     savedDurationS = existing.size / (2 * 48000);
   } catch {
     // File didn't exist yet, start from 0.
@@ -652,11 +623,19 @@ async function collectDriver(
         ? `, scanning to min ${args.endMin} (seg ${endSegment})`
         : " (until stream end)";
   console.log(
-    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | passes: ${args.passes} | ratio threshold: ${args.threshold} dB | out: ${outPath}`,
+    `[${tla}] Starting at segment ${startSegment} (min ${args.startMin})${rangeDesc} | vad-threshold: ${args.vadThreshold} | vad-speech-pct: ${(args.vadSpeechPct * 100).toFixed(0)}% | out: ${outPath}`,
   );
 
-  // Prefetcher keeps 2 segment downloads running ahead of the decode loop,
-  // overlapping network I/O with FFmpeg CPU work.
+  // Load ONNX session once per driver (model is shared but state is per-driver).
+  let vadSession: VadSession;
+  try {
+    vadSession = await createVadSession();
+  } catch (err) {
+    throw new Error(
+      `[${tla}] Failed to load Silero VAD model: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
   const prefetcher = new SegmentPrefetcher(
     initSegment,
     manifest.mediaTemplate,
@@ -666,7 +645,7 @@ async function collectDriver(
   prefetcher.prime(startSegment);
 
   while (endSegment === null || segmentNumber <= endSegment) {
-    // Check --max-minutes cap (include already-saved from prior runs).
+    // Check --max-minutes cap (includes already-saved from prior runs).
     if (
       maxSavedSamples !== null &&
       savedDurationS + kept * SEGMENT_DURATION_S >= maxSavedSamples
@@ -683,19 +662,14 @@ async function collectDriver(
     const relSeg = segmentNumber - startSegment + 1;
     const label = `${relSeg}${maxLabel}`;
 
-    let concatBuffer: Buffer;
     const prefetched = await prefetcher.get(segmentNumber);
     if (prefetched === null) {
-      // null = download failed (likely past end of stream or stopped).
-      console.log(
-        `[${tla}  ${label}] download failed — stopping`,
-      );
+      console.log(`[${tla}  ${label}] download failed — stopping`);
       break;
     }
-    concatBuffer = prefetched;
+    const concatBuffer = prefetched;
 
-
-    // Decode raw PCM first — needed both for the ratio check and to save noise segments.
+    // -- Decode raw PCM (single FFmpeg spawn) --
     let rawPcm: Buffer;
     try {
       rawPcm = await withRetry(
@@ -713,64 +687,44 @@ async function collectDriver(
       continue;
     }
 
-    let denoisedPcm: Buffer;
-    try {
-      denoisedPcm = await withRetry(
-        () => decodeSegmentDenoise(concatBuffer, args.passes),
-        `[${tla} seg ${segmentNumber}] denoise decode`,
-        2,
-        200,
-      );
-    } catch (err) {
-      errors++;
-      console.log(
-        `[${tla}  ${label}] denoise decode error — ${err instanceof Error ? err.message : String(err)} — skipping`,
-      );
-      segmentNumber++;
-      continue;
-    }
+    // -- VAD inference (in-process ONNX, no FFmpeg) --
+    const vadResult = await runVad(vadSession, rawPcm, args.vadThreshold);
 
     const rawDb = rmsDb(rawPcm);
-    const denoisedDb = rmsDb(denoisedPcm);
-    // Suppression ratio: how much arnndn reduced the signal.
-    // Heavy suppression (very negative ratio) = no speech detected.
-    // Mild suppression = speech present (model preserved it).
-    const ratio = Number.isFinite(rawDb) && Number.isFinite(denoisedDb)
-      ? denoisedDb - rawDb
-      : -Infinity;
-    const ratioStr = Number.isFinite(ratio) ? `${ratio.toFixed(1)} dB` : "-inf dB";
     const rawDbStr = Number.isFinite(rawDb) ? `${rawDb.toFixed(1)} dB` : "-inf dB";
-    const denoisedDbStr = Number.isFinite(denoisedDb) ? `${denoisedDb.toFixed(1)} dB` : "-inf dB";
+    const vadPctStr = (vadResult.speechPct * 100).toFixed(1);
+    const pMaxStr = vadResult.probability.toFixed(2);
 
-    // Noise = arnndn suppressed heavily (ratio below threshold). Speech = ratio near 0.
-    const isNoise = ratio < args.threshold;
+    // Noise = fewer than vadSpeechPct of frames have speech
+    const isNoise = vadResult.speechPct < args.vadSpeechPct;
 
     if (isNoise) {
       fs.writeSync(outFd, rawPcm);
       kept++;
-      consecutiveSilent++;
+      consecutiveNoise++;
       const keptMin = (
         (savedDurationS + kept * SEGMENT_DURATION_S) /
         60
       ).toFixed(1);
       console.log(
-        `[${tla}  ${label}] raw: ${rawDbStr} | denoised: ${denoisedDbStr} | ratio: ${ratioStr} — NOISE  (saved | ${keptMin} min total)`,
+        `[${tla}  ${label}] rms: ${rawDbStr} | vad: ${vadPctStr}% speech (p_max=${pMaxStr}) — NOISE  (saved | ${keptMin} min total)`,
       );
 
-      // Retirement detection: N consecutive below-threshold segments suggests car stopped.
-      if (args.retireAfter !== null && consecutiveSilent >= args.retireAfter) {
+      if (args.retireAfter !== null && consecutiveNoise >= args.retireAfter) {
         retired = true;
         prefetcher.stop();
         console.log(
-          `[${tla}] ${consecutiveSilent} consecutive noise segments — likely retired. Stopping.`,
+          `[${tla}] ${consecutiveNoise} consecutive noise segments — likely retired. Stopping.`,
         );
         segmentNumber++;
         break;
       }
     } else {
-      consecutiveSilent = 0; // Reset on any speech segment.
+      consecutiveNoise = 0;
       skipped++;
-      console.log(`[${tla}  ${label}] raw: ${rawDbStr} | denoised: ${denoisedDbStr} | ratio: ${ratioStr} — SPEECH (skipped)`);
+      console.log(
+        `[${tla}  ${label}] rms: ${rawDbStr} | vad: ${vadPctStr}% speech (p_max=${pMaxStr}) — SPEECH (skipped)`,
+      );
     }
 
     segmentNumber++;
@@ -858,7 +812,6 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  // Randomly select N drivers
   const shuffled = [...obcPlayers].sort(() => Math.random() - 0.5);
   const selected = shuffled.slice(
     0,
@@ -872,7 +825,6 @@ async function main(): Promise<void> {
     console.log(`Max noise to save per driver: ${args.maxMinutes} min`);
   }
 
-  // Ensure output directory exists
   await fsPromises.mkdir(args.outDir, { recursive: true });
 
   // Auto-skip: probe stream boundaries before launching all drivers.
@@ -880,11 +832,9 @@ async function main(): Promise<void> {
     startSegment: null,
     endSegment: null,
   };
-  // Stream context from the probe driver, reused to skip re-fetching manifest/init.
   let probedStreamContext: { tla: string; context: DriverStreamContext } | null = null;
 
   if (args.autoSkip && args.length === null) {
-    // Try each driver in order until one produces a usable probe result.
     for (const probePlayer of selected) {
       try {
         const probed = await probeStreamBounds(tokens, probePlayer, args);
@@ -911,8 +861,6 @@ async function main(): Promise<void> {
 
   const wallStart = Date.now();
 
-  // Run all drivers concurrently, passing pre-fetched stream context to whichever
-  // driver was used for probing so it skips a redundant manifest + init fetch.
   const results = await Promise.all(
     selected.map((player) =>
       collectDriver(
