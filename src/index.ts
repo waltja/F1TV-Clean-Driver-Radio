@@ -1,12 +1,13 @@
 import process from "node:process";
 import { ask, cacheToken, clearTokenCache, loadCachedToken, promptForToken } from "./auth.js";
-import { decodeSegment } from "./audio.js";
+import { decodeSegmentRaw, decodeSegmentSingleDenoise } from "./audio.js";
 import { buildSegmentUrl, fetchManifest } from "./dash.js";
 import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
 import { Player } from "./player.js";
 import { concatInitAndSegment, downloadInit, downloadSegment } from "./segments.js";
+import { createVadSession, runVad } from "./vad.js";
 import { fetchPlayers, isSeek, segmentNumberForTime } from "./sync.js";
-import { LATENCY_COMPENSATION_S, POLL_INTERVAL_MS, RING_BUFFER_DEPTH, SEGMENT_DURATION_S } from "./types.js";
+import { LATENCY_COMPENSATION_S, POLL_INTERVAL_MS, RING_BUFFER_DEPTH, SEGMENT_DURATION_S, VAD_SPEECH_PCT, VAD_THRESHOLD } from "./types.js";
 import type { MvPlayer, Tokens } from "./types.js";
 
 async function selectDriver(players: MvPlayer[]): Promise<MvPlayer> {
@@ -64,6 +65,18 @@ async function main(): Promise<void> {
   const streamUrl = await fetchStreamUrl(tokens, contentId, channelId);
   const manifest = await fetchManifest(streamUrl);
   const initSegment = await downloadInit(manifest.initUrl);
+
+  const vadSession = await createVadSession();
+
+  // Serialize VAD inference: runVad() mutates session state per-frame, so concurrent
+  // calls on the same session would interleave their frame writes. Downloads and raw
+  // decodes still run concurrently; only the ONNX inference step is queued.
+  let vadQueue = Promise.resolve();
+  function enqueueVad<T>(fn: () => Promise<T>): Promise<T> {
+    const result = vadQueue.then(fn, fn);
+    vadQueue = result.then(() => {}, () => {});
+    return result;
+  }
 
   const player = new Player();
   const inFlight = new Set<number>();
@@ -138,7 +151,28 @@ async function main(): Promise<void> {
                 const segmentUrl = buildSegmentUrl(manifest.mediaTemplate, segmentNumber);
                 const compressedSegment = await downloadSegment(segmentUrl);
                 const joinedSegment = concatInitAndSegment(initSegment, compressedSegment);
-                const pcmSegment = await decodeSegment(joinedSegment);
+
+                // Step 1: raw decode (~30ms) -- concurrent across segments.
+                const rawPcm = await decodeSegmentRaw(joinedSegment);
+
+                // Step 2: serialized VAD inference (~5ms).
+                const vadResult = await enqueueVad(() => runVad(vadSession, rawPcm, VAD_THRESHOLD));
+
+                // Step 3: branch on VAD result.
+                let pcmSegment: Buffer;
+                if (vadResult.speechPct >= VAD_SPEECH_PCT) {
+                  // Speech detected: single arnndn pass (~150ms).
+                  pcmSegment = await decodeSegmentSingleDenoise(joinedSegment);
+                  console.log(
+                    `[vad] seg ${segmentNumber}: SPEECH (${(vadResult.speechPct * 100).toFixed(1)}%, p=${vadResult.probability.toFixed(2)})`,
+                  );
+                } else {
+                  // Engine-only: output silence.
+                  pcmSegment = Buffer.alloc(rawPcm.length);
+                  console.log(
+                    `[vad] seg ${segmentNumber}: noise  (${(vadResult.speechPct * 100).toFixed(1)}%, p=${vadResult.probability.toFixed(2)})`,
+                  );
+                }
 
                 // Drop results decoded against a pre-seek generation.
                 if (activeGeneration !== generation) {
