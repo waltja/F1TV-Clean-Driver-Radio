@@ -26,7 +26,8 @@
   "type": "module",
   "dependencies": {
     "fast-xml-parser": "^5.9.3",
-    "onnxruntime-node": "^1.22.0",
+    "fft-js": "^0.0.12",
+    "onnxruntime-node": "^1.27.0",
     "speaker": "^0.5.5"
   },
   "devDependencies": {

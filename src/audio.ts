@@ -7,7 +7,7 @@ const FFMPEG_ARGS = [
   "-i", "pipe:0",
   "-ac", "1",
   "-ar", "48000",
-  "-af", `highpass=f=300,lowpass=f=3400,arnndn=m=${MODEL_PATH},arnndn=m=${MODEL_PATH}`,
+  "-af", `highpass=f=300,lowpass=f=3400`,
   "-f", "s16le",
   "pipe:1",
 ];
@@ -16,7 +16,7 @@ const FFMPEG_SINGLE_DENOISE_ARGS = [
   "-i", "pipe:0",
   "-ac", "1",
   "-ar", "48000",
-  "-af", `highpass=f=300,lowpass=f=3400,arnndn=m=${MODEL_PATH}`,
+  "-af", `highpass=f=300,lowpass=f=3400,anlmdn=s=9:p=0.01:r=0.05:m=15`,
   "-f", "s16le",
   "pipe:1",
 ];
@@ -215,6 +215,37 @@ export function decodeSegment(concatBuffer: Buffer): Promise<Buffer> {
         reject(new Error(`decodeSegment: ffmpeg exited with code ${code}`));
         return;
       }
+      resolve(Buffer.concat(chunks));
+    });
+  });
+}
+
+export function decodeSegmentWithFilter(pcm: Buffer): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const ffmpeg = spawn("ffmpeg", [
+      "-f", "s16le", "-ar", "48000", "-ac", "1",
+      "-i", "pipe:0",
+      "-af", "highpass=f=300,lowpass=f=3400",
+      "-f", "s16le",
+      "pipe:1",
+    ], { stdio: ["pipe", "pipe", "ignore"] });
+
+    const chunks: Buffer[] = [];
+    let settled = false;
+
+    ffmpeg.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    ffmpeg.once("error", (e: NodeJS.ErrnoException) => {
+      if (settled) return; settled = true;
+      reject(new Error(`decodeSegmentWithFilter: ${e.message}`));
+    });
+    ffmpeg.stdin.once("error", (e: NodeJS.ErrnoException) => {
+      if (settled) return; settled = true;
+      reject(new Error(`decodeSegmentWithFilter: stdin: ${e.message}`));
+    });
+    ffmpeg.once("spawn", () => { if (!settled) ffmpeg.stdin.end(pcm); });
+    ffmpeg.once("close", (code) => {
+      if (settled) return; settled = true;
+      if (code !== 0) { reject(new Error(`decodeSegmentWithFilter: exited ${code}`)); return; }
       resolve(Buffer.concat(chunks));
     });
   });

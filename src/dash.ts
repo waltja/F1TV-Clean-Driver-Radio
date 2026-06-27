@@ -9,6 +9,7 @@ const parser = new XMLParser({
 interface ParsedSegmentTemplate {
   "@_initialization"?: string;
   "@_media"?: string;
+  "@_startNumber"?: string;
 }
 
 interface ParsedRole {
@@ -16,6 +17,7 @@ interface ParsedRole {
 }
 
 interface ParsedRepresentation {
+  "@_id"?: string;
   BaseURL?: string;
   SegmentTemplate?: ParsedSegmentTemplate;
 }
@@ -87,31 +89,35 @@ function resolveUrl(base: string, ref: string): string {
 function resolveTemplateSource(
   periodBaseUrl: string,
   adaptationSet: ParsedAdaptationSet,
-): { baseUrl: string; template: ParsedSegmentTemplate } | undefined {
+): { baseUrl: string; template: ParsedSegmentTemplate; representationId: string } | undefined {
   const adaptationBaseUrl = adaptationSet.BaseURL
     ? resolveUrl(periodBaseUrl, adaptationSet.BaseURL)
     : periodBaseUrl;
 
+  const firstRepresentation = toArray(adaptationSet.Representation)[0];
+  const representationId = firstRepresentation?.["@_id"] ?? "";
+
   if (adaptationSet.SegmentTemplate) {
-    return { baseUrl: adaptationBaseUrl, template: adaptationSet.SegmentTemplate };
+    return { baseUrl: adaptationBaseUrl, template: adaptationSet.SegmentTemplate, representationId };
   }
 
-  const representation = toArray(adaptationSet.Representation)[0];
-  if (!representation?.SegmentTemplate) return undefined;
+  if (!firstRepresentation?.SegmentTemplate) return undefined;
 
-  const representationBaseUrl = representation.BaseURL
-    ? resolveUrl(adaptationBaseUrl, representation.BaseURL)
+  const representationBaseUrl = firstRepresentation.BaseURL
+    ? resolveUrl(adaptationBaseUrl, firstRepresentation.BaseURL)
     : adaptationBaseUrl;
 
-  return { baseUrl: representationBaseUrl, template: representation.SegmentTemplate };
+  return { baseUrl: representationBaseUrl, template: firstRepresentation.SegmentTemplate, representationId };
 }
 
 export async function fetchManifest(mpdUrl: string): Promise<DashManifest> {
+  console.log("[dash] fetching manifest:", mpdUrl);
   const res = await fetch(mpdUrl);
   if (!res.ok) {
     throw new Error(`fetchManifest: HTTP ${res.status} from ${mpdUrl}`);
   }
   const xml = await res.text();
+  // console.log("[dash] manifest:\n", xml); // temporary
   return parseManifest(xml, mpdUrl);
 }
 
@@ -122,11 +128,13 @@ export function parseManifest(xml: string, mpdUrl: string): DashManifest {
     throw new Error("parseManifest: missing MPD root element");
   }
 
-  const mpdBaseUrl = mpd.BaseURL ? resolveUrl(mpdUrl, mpd.BaseURL) : mpdUrl;
+  // Deliberately ignore mpd.BaseURL — it resolves to the bare CDN URL
+  // which drops the authentication token present in mpdUrl.
+  const mpdBaseUrl = mpdUrl;
   const periods = toArray(mpd.Period);
 
   for (const period of periods) {
-    const periodBaseUrl = period.BaseURL ? resolveUrl(mpdBaseUrl, period.BaseURL) : mpdBaseUrl;
+    const periodBaseUrl = mpdBaseUrl; // ignore period.BaseURL for same reason
     const adaptationSets = toArray(period.AdaptationSet);
 
     for (const adaptationSet of adaptationSets) {
@@ -145,8 +153,9 @@ export function parseManifest(xml: string, mpdUrl: string): DashManifest {
 
       return {
         baseUrl: source.baseUrl,
-        initUrl: resolveUrl(source.baseUrl, initialization),
-        mediaTemplate: resolveUrl(source.baseUrl, media),
+        initUrl: resolveUrl(source.baseUrl, initialization).replace("$RepresentationID$", source.representationId),
+        mediaTemplate: resolveUrl(source.baseUrl, media).replace("$RepresentationID$", source.representationId),
+        startNumber: Number(source.template["@_startNumber"] ?? "1"),
       };
     }
   }
@@ -154,9 +163,9 @@ export function parseManifest(xml: string, mpdUrl: string): DashManifest {
   throw new Error("No 'tea' audio track found in manifest");
 }
 
-export function buildSegmentUrl(mediaTemplate: string, segmentNumber: number): string {
+export function buildSegmentUrl(mediaTemplate: string, segmentNumber: number, startNumber: number): string {
   if (!mediaTemplate.includes("$Number$")) {
     throw new Error("buildSegmentUrl: media template missing $Number$");
   }
-  return mediaTemplate.replace("$Number$", String(segmentNumber));
+  return mediaTemplate.replace("$Number$", String(startNumber + segmentNumber - 1));
 }
