@@ -3,7 +3,7 @@ import type { Tokens } from "./types.js";
 const ENTITLEMENT_URL =
   "https://f1tv.formula1.com/2.0/R/ENG/WEB_DASH/ALL/USER/ENTITLEMENT";
 const PLAY_URL_BASE =
-  "https://f1tv.formula1.com/2.0/R/ENG/BIG_SCREEN_HLS/ALL/CONTENT/PLAY";
+  "https://f1tv.formula1.com/2.0/R/ENG/BIG_SCREEN_DASH/ALL/CONTENT/PLAY";
 
 // Content discovery — no entitlement token required for browse/metadata endpoints.
 const PAGE_URL_BASE =

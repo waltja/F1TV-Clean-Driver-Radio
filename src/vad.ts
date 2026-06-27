@@ -31,6 +31,7 @@ export interface VadResult {
   totalFrames: number;
   /** speechFrames / totalFrames */
   speechPct: number;
+  frameProbs: number[];
 }
 
 export interface VadSession {
@@ -102,6 +103,7 @@ export async function runVad(
 
   let speechFrames = 0;
   let maxProb = 0;
+  const frameProbs: number[] = [];
 
   // Resolve output tensor names on first call (avoids hard-coding names that
   // differ between ONNX export batches).
@@ -136,6 +138,7 @@ export async function runVad(
     vs.context = chunk.slice(CHUNK_SIZE - CONTEXT_SIZE);
 
     const prob = (results[outName].data as Float32Array)[0];
+    frameProbs.push(prob);
     if (prob > maxProb) maxProb = prob;
     if (prob >= threshold) speechFrames++;
   }
@@ -147,5 +150,6 @@ export async function runVad(
     speechFrames,
     totalFrames,
     speechPct,
+    frameProbs
   };
 }

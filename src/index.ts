@@ -1,6 +1,6 @@
 import process from "node:process";
 import { ask, cacheToken, clearTokenCache, loadCachedToken, promptForToken } from "./auth.js";
-import { decodeSegmentRaw, decodeSegmentSingleDenoise } from "./audio.js";
+import { decodeSegmentRaw, decodeSegmentWithFilter } from "./audio.js";
 import { buildSegmentUrl, fetchManifest } from "./dash.js";
 import { fetchEntitlementToken, fetchStreamUrl } from "./f1api.js";
 import { Player } from "./player.js";
@@ -11,12 +11,13 @@ import { LATENCY_COMPENSATION_S, POLL_INTERVAL_MS, RING_BUFFER_DEPTH, SEGMENT_DU
 import type { MvPlayer, Tokens } from "./types.js";
 
 async function selectDriver(players: MvPlayer[]): Promise<MvPlayer> {
-  if (players.length === 0) {
-    throw new Error("selectDriver: no players available in MultiViewer");
+  const validPlayers = players.filter((p) => p.driverData != null);
+  if (validPlayers.length === 0) {
+    throw new Error("selectDriver: no players with driver data available — is a session active in MultiViewer?");
   }
 
   for (;;) {
-    for (const [index, player] of players.entries()) {
+    for (const [index, player] of validPlayers.entries()) {
       console.log(
         `${index + 1}. ${player.driverData.tla} #${player.driverData.driverNumber} ${player.driverData.teamName}`,
       );
@@ -25,11 +26,11 @@ async function selectDriver(players: MvPlayer[]): Promise<MvPlayer> {
     const answer = await ask("Select driver: ");
     const selectedIndex = Number.parseInt(answer, 10) - 1;
 
-    if (Number.isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= players.length) {
+    if (Number.isNaN(selectedIndex) || selectedIndex < 0 || selectedIndex >= validPlayers.length) {
       console.log("Invalid selection. Try again.");
       continue;
     }
-    return players[selectedIndex];
+    return validPlayers[selectedIndex];
   }
 }
 
@@ -148,7 +149,7 @@ async function main(): Promise<void> {
             // Fire-and-forget: never blocks the poll tick.
             void (async () => {
               try {
-                const segmentUrl = buildSegmentUrl(manifest.mediaTemplate, segmentNumber);
+                const segmentUrl = buildSegmentUrl(manifest.mediaTemplate, segmentNumber, manifest.startNumber);
                 const compressedSegment = await downloadSegment(segmentUrl);
                 const joinedSegment = concatInitAndSegment(initSegment, compressedSegment);
 
@@ -161,11 +162,27 @@ async function main(): Promise<void> {
                 // Step 3: branch on VAD result.
                 let pcmSegment: Buffer;
                 if (vadResult.speechPct >= VAD_SPEECH_PCT) {
-                  // Speech detected: single arnndn pass (~150ms).
-                  pcmSegment = await decodeSegmentSingleDenoise(joinedSegment);
-                  console.log(
-                    `[vad] seg ${segmentNumber}: SPEECH (${(vadResult.speechPct * 100).toFixed(1)}%, p=${vadResult.probability.toFixed(2)})`,
-                  );
+                  // Step 3: frame-level VAD mask on rawPcm, one filter pass if any speech.
+                  const FRAME_BYTES_48K = 512 * 3 * 2; // 3072: 512 16kHz samples × 3 × 2 bytes
+                  const PAD_FRAMES = 8; // ~256ms padding around speech frames
+                  const { frameProbs } = vadResult;
+                  const masked = Buffer.from(rawPcm);
+                  let anySpeech = false;
+                  for (let fi = 0; fi < frameProbs.length; fi++) {
+                    const isSpeech = frameProbs
+                      .slice(Math.max(0, fi - PAD_FRAMES), fi + PAD_FRAMES + 1)
+                      .some((p) => p >= VAD_THRESHOLD);
+                    if (isSpeech) {
+                      anySpeech = true;
+                    } else {
+                      const s = fi * FRAME_BYTES_48K;
+                      masked.fill(0, s, Math.min(s + FRAME_BYTES_48K, masked.length));
+                    }
+                  }
+                  pcmSegment = anySpeech
+                    ? await decodeSegmentWithFilter(masked)
+                    : Buffer.alloc(rawPcm.length);
+                  console.log(`[vad] seg ${segmentNumber}: ${anySpeech ? "SPEECH" : "noise "} (${(vadResult.speechPct * 100).toFixed(1)}%, p=${vadResult.probability.toFixed(2)})`);
                 } else {
                   // Engine-only: output silence.
                   pcmSegment = Buffer.alloc(rawPcm.length);
