@@ -12,3 +12,6 @@ training-data/
 
 # macOS
 .DS_Store
+
+# Pycharm
+.idea/
