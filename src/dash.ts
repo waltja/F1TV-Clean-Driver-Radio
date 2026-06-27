@@ -111,7 +111,7 @@ function resolveTemplateSource(
 }
 
 export async function fetchManifest(mpdUrl: string): Promise<DashManifest> {
-  console.log("[dash] fetching manifest:", mpdUrl);
+  // console.log("[dash] fetching manifest:", mpdUrl);
   const res = await fetch(mpdUrl);
   if (!res.ok) {
     throw new Error(`fetchManifest: HTTP ${res.status} from ${mpdUrl}`);

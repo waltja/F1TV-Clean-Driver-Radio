@@ -60,7 +60,7 @@ async function main(): Promise<void> {
   const args = parseArgs();
   const targetSeason = args.season ?? new Date().getFullYear();
 
-  // Auth — same flow as collect-noise
+  // Auth flow matches the live playback entrypoint.
   let ascendonToken: string;
 
   const cached = await loadCachedToken();

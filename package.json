@@ -5,12 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "tsx src/index.ts",
-    "collect-noise": "tsx src/collect.ts",
     "list-races": "tsx src/list-races.ts",
-    "collect-speech": "tsx src/collect-speech.ts",
-    "concat-noise": "bash scripts/concat-noise.sh",
-    "concat-signal": "bash scripts/concat-signal.sh",
-    "concat-speech": "bash scripts/concat-signal.sh",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -26,7 +21,6 @@
   "type": "module",
   "dependencies": {
     "fast-xml-parser": "^5.9.3",
-    "fft-js": "^0.0.12",
     "onnxruntime-node": "^1.27.0",
     "speaker": "^0.5.5"
   },
