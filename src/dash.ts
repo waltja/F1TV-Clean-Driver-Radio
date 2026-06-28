@@ -82,7 +82,12 @@ function resolveUrl(base: string, ref: string): string {
   try {
     return new URL(ref).href; // ref already absolute
   } catch {
-    return new URL(ref, base).href;
+    const baseUrl = new URL(base);
+    const resolved = new URL(ref, baseUrl);
+    if (!resolved.search && baseUrl.search && !ref.startsWith("?")) {
+      resolved.search = baseUrl.search;
+    }
+    return resolved.href;
   }
 }
 

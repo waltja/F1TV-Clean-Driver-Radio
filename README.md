@@ -106,7 +106,6 @@ src/
   player.ts           node-speaker wrapper, ring buffer, seek/pause, PCM trim
   sync.ts             MV GraphQL polling, segment number math, seek detection
   types.ts            Shared interfaces and constants
-  list-races.ts       Race and OBC channel discovery CLI
   types/speaker.d.ts  Type declarations for node-speaker
 models/
   silero_vad.onnx     Silero VAD v6 ONNX model

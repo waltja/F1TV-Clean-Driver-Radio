@@ -2,11 +2,10 @@
   "name": "f1-radio",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
     "start": "tsx src/index.ts",
-    "list-races": "tsx src/list-races.ts",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "probe-live-audio": "tsx src/probe-live-audio.ts",
+    "test": "tsx --test tests/player.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -25,7 +24,7 @@
     "speaker": "^0.5.5"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.0.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

@@ -37,11 +37,6 @@ export interface DashManifest {
   startNumber: number;
 }
 
-export interface SegmentRef {
-  number: number; // 1-indexed
-  url: string;
-}
-
 export interface PcmSegment {
   number: number; // 1-indexed segment number
   pcm: Buffer; // 48kHz mono s16le
