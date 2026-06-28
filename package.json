@@ -2,15 +2,10 @@
   "name": "f1-radio",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
   "scripts": {
     "start": "tsx src/index.ts",
-    "collect-noise": "tsx src/collect.ts",
-    "list-races": "tsx src/list-races.ts",
-    "collect-speech": "tsx src/collect-speech.ts",
-    "concat-noise": "bash scripts/concat-noise.sh",
-    "concat-signal": "bash scripts/concat-signal.sh",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "probe-live-audio": "tsx src/probe-live-audio.ts",
+    "test": "tsx --test tests/player.test.ts"
   },
   "keywords": [],
   "author": "",
@@ -25,10 +20,11 @@
   "type": "module",
   "dependencies": {
     "fast-xml-parser": "^5.9.3",
+    "onnxruntime-node": "^1.27.0",
     "speaker": "^0.5.5"
   },
   "devDependencies": {
-    "@types/node": "^26.0.0",
+    "@types/node": "^26.0.1",
     "tsx": "^4.22.4",
     "typescript": "^6.0.3"
   }

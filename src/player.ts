@@ -1,9 +1,27 @@
 import Speaker from "speaker";
+import { EventEmitter } from "node:events";
+import process from "node:process";
 import type { PcmSegment } from "./types.js";
 import { RING_BUFFER_DEPTH } from "./types.js";
 
+const DEBUG = process.argv.includes("--debug");
+
+function debugLog(message: string): void {
+  if (DEBUG) {
+    console.log(message);
+  }
+}
+
+export interface SpeakerLike extends EventEmitter {
+  write(buffer: Buffer): boolean;
+  end(buffer?: Buffer): void;
+  close(flush?: boolean): void;
+}
+
+export type SpeakerFactory = () => SpeakerLike;
+
 export class Player {
-  private speaker: Speaker;
+  private speaker: SpeakerLike;
   private readonly queuedSegments = new Map<number, Buffer>();
   private _playhead = 0;
   private closed = false;
@@ -11,18 +29,19 @@ export class Player {
   private pumping = false;
   private waitingForDrain = false;
   private silenceTimer: ReturnType<typeof setInterval> | null = null;
+  private hasWrittenRealAudio = false;
   // Bytes to trim from the start of the first segment after a reseek.
   private trimBytes = 0;
 
   // 100ms of silence at 48kHz mono s16le (4800 samples * 2 bytes)
   private static readonly SILENCE = Buffer.alloc(9600);
 
-  constructor() {
+  constructor(private readonly speakerFactory: SpeakerFactory = () => new Speaker({ channels: 1, bitDepth: 16, sampleRate: 48000 })) {
     this.speaker = this.createSpeaker();
   }
 
-  private createSpeaker(): Speaker {
-    const s = new Speaker({ channels: 1, bitDepth: 16, sampleRate: 48000 });
+  private createSpeaker(): SpeakerLike {
+    const s = this.speakerFactory();
     s.on("error", (err: Error) => {
       console.error(`speaker error: ${err.message}`);
     });
@@ -40,6 +59,9 @@ export class Player {
   pause(): void {
     if (this.closed || this._paused) return;
     this._paused = true;
+    if (!this.hasWrittenRealAudio) {
+      return;
+    }
     // Write silence to keep CoreAudio fed and avoid buffer underflow warnings.
     this.silenceTimer = setInterval(() => {
       if (!this.closed) this.speaker.write(Player.SILENCE);
@@ -65,14 +87,7 @@ export class Player {
       return;
     }
 
-    // Apply byte-level trim to the first segment after a reseek so we start
-    // at the correct position within that segment rather than at its boundary.
-    let pcm = segment.pcm;
-    if (segment.number === this._playhead && this.trimBytes > 0) {
-      pcm = pcm.subarray(Math.min(this.trimBytes, pcm.length));
-      this.trimBytes = 0;
-    }
-    this.queuedSegments.set(segment.number, pcm);
+    this.queuedSegments.set(segment.number, segment.pcm);
 
     // Bound memory. Already-played segments (< playhead) are dropped above, so
     // every queued entry is >= playhead; keep the ones closest to the playhead
@@ -90,22 +105,28 @@ export class Player {
 
   reseek(segmentNumber: number, offsetIntoSegmentS = 0): void {
     if (this.closed) return;
-    // Recreate the Speaker to flush CoreAudio's internal buffer (~200-400ms of
-    // stale pre-seek audio). Causes a brief gap but gives a clean cut on seek.
-    try {
-      this.speaker.close(false);
-    } catch {
-      // ignore close errors
-    }
+    debugLog(`[player] reseek start segment=${segmentNumber} offset=${offsetIntoSegmentS.toFixed(3)} paused=${this._paused} playhead=${this._playhead}`);
+    const staleSpeaker = this.speaker;
     this.pumping = false;
     this.waitingForDrain = false;
     this.speaker = this.createSpeaker();
-    // If paused, restart the silence feed on the new speaker instance.
-    if (this._paused && this.silenceTimer === null) {
-      this.silenceTimer = setInterval(() => {
-        if (!this.closed) this.speaker.write(Player.SILENCE);
-      }, 90);
+
+    // Rotate to a fresh speaker immediately, then let the old one flush/close on
+    // its own writable lifecycle instead of blocking the reseek path on close().
+    // This avoids the hard freeze, but it is still only a best-effort flush: the
+    // backend may drain a short tail of pre-seek audio before the old stream ends.
+    // TODO: plan and implement a cleaner reseek handoff that can flush stale
+    // backend audio deterministically without risking the previous close() stall.
+    try {
+      staleSpeaker.end();
+    } catch {
+      try {
+        staleSpeaker.close(false);
+      } catch {
+        // ignore speaker shutdown errors during reseek
+      }
     }
+
     // Compute how many PCM bytes to skip from the first segment so playback
     // starts at the right position within it rather than at the segment boundary.
     // 48000 samples/s, 2 bytes/sample (s16le), 1 channel.
@@ -113,6 +134,7 @@ export class Player {
     this.trimBytes = trimSamples * 2;
     this.queuedSegments.clear();
     this._playhead = segmentNumber;
+    debugLog(`[player] reseek ready trimBytes=${this.trimBytes} nextPlayhead=${this._playhead}`);
   }
 
   close(): void {
@@ -137,16 +159,28 @@ export class Player {
     this.pumping = true;
     try {
       while (!this.closed) {
-        const pcm = this.queuedSegments.get(this._playhead);
-        if (!pcm) break;
+        const queued = this.queuedSegments.get(this._playhead);
+        if (!queued) break;
+
+        let pcm = queued;
+        if (this.trimBytes > 0) {
+          const bytesToTrim = Math.min(this.trimBytes, pcm.length);
+          pcm = pcm.subarray(bytesToTrim);
+          this.trimBytes -= bytesToTrim;
+        }
 
         this.queuedSegments.delete(this._playhead);
         this._playhead += 1;
+        this.hasWrittenRealAudio = true;
 
-        const canContinue = this.speaker.write(pcm);
+        const activeSpeaker = this.speaker;
+        const canContinue = activeSpeaker.write(pcm);
         if (!canContinue) {
           this.waitingForDrain = true;
-          this.speaker.once("drain", () => {
+          activeSpeaker.once("drain", () => {
+            if (this.closed || this.speaker !== activeSpeaker) {
+              return;
+            }
             this.waitingForDrain = false;
             this.pump();
           });
